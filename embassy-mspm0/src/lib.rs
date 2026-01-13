@@ -30,6 +30,9 @@ pub mod trng;
 pub mod uart;
 pub mod wwdt;
 
+// TODO: add feature flag for this.
+pub mod can;
+
 /// Operating modes for peripherals.
 pub mod mode {
     trait SealedMode {}
