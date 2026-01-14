@@ -3,10 +3,12 @@ use core::marker::PhantomData;
 use embassy_hal_internal::PeripheralType;
 
 use crate::Peri;
-use crate::gpio::AnyPin;
+use crate::gpio::{AnyPin, PfType};
 use crate::interrupt::Interrupt;
 use crate::mode::{Blocking, Mode};
 use crate::pac::canfd::{Canfd as Regs, vals as CanVals};
+use crate::pac::{self};
+
 use embassy_sync::waitqueue::AtomicWaker;
 
 pub(crate) struct Info { // metadata/details about the specific instance of the peripheral in use.
@@ -78,15 +80,15 @@ pub enum ClockDiv {
 /// Note that the hardware adds '1' to each of the values placed in the registers of the peripheral.
 /// This crate handles this for you, so the values in this struct should be the actual values you wish to use.
 pub struct CanTimings {
-    brs: u16, /// Bitrate prescaler, valid values 1-512. 
+    brp: u16, /// Bitrate prescaler, valid values 1-512. 
     sjw: u8, /// Sync Jump Width - valid values 1-128, though must also be <= ntseg2.
     ntseg1: u16, // Segment 1 time. Valid values are 2-256
     ntseg2: u8, // Segment 2 time. Valid values are 2-128.
 }
 
 impl CanTimings {
-    pub const fn from_values(brs: u16, sjw: u8, ntseg1: u16, ntseg2: u8) -> Option<CanTimings> {
-        Some(CanTimings { brs, sjw, ntseg1, ntseg2 })
+    pub const fn from_values(brp: u16, sjw: u8, ntseg1: u16, ntseg2: u8) -> Option<CanTimings> {
+        Some(CanTimings { brp, sjw, ntseg1, ntseg2 })
     }
 }
 
@@ -102,7 +104,11 @@ pub struct Config {
     pub clock_div: ClockDiv,
 
     /// CAN timings to use for standard CAN. (CAN-FD support to come later.)
-    pub timing: CanTimings
+    pub timing: CanTimings,
+
+    pub accept_remote_frames: bool,
+
+    pub accept_extended_ids: bool
 }
 
 #[non_exhaustive]
@@ -134,7 +140,7 @@ impl<'d> Can<'d, Blocking> {
     pub fn new_blocking<T: Instance> (
         peri: Peri<'d, T>,
         rx: Peri<'d, impl RxPin<T>>,
-        tx: Peri<'d, impl RxPin<T>>,
+        tx: Peri<'d, impl TxPin<T>>,
         config: Config
     ) -> Result<Self, InitializationError> {
 
@@ -143,16 +149,192 @@ impl<'d> Can<'d, Blocking> {
 }
 
 impl<'d, M: Mode> Can<'d, M> {
+    fn reset_poweron<T: Instance>(_peri: &Peri<'d, T>, config: &Config) -> Result<(), InitializationError> {
+        // See e2e: https://e2e.ti.com/support/microcontrollers/arm-based-microcontrollers-group/arm-based-microcontrollers/f/arm-based-microcontrollers-forum/1605241/mspm0g3107-mcan-peripheral-does-not-complete-initialization-after-power-on-reset
+        // The initialization instructions in the TRM are not accurate at this time, which I had to figure out the hard way.
+        // Suggested "restart" / reset approach is to do a reset, then disable power, then re-enable power.
+        // If you do not wait >= 50us before accessing peripheral registers for the first time (or trying to enable clock) after enabling power,
+        // the peripheral will lock up and only ever return zeros until reset via sysrst.
+        let can = T::info().regs;
+
+        can.rstctl().write(|w| {
+            w.set_resetstkyclr(true);
+            w.set_resetassert(true);
+            w.set_key(CanVals::ResetKey::KEY);
+        });
+        cortex_m::asm::delay(16);
+
+        can.pwren().write(|w| {
+            w.set_enable(false);
+            w.set_key(CanVals::PwrenKey::KEY);
+        });
+        cortex_m::asm::delay(32);
+
+        can.pwren().write(|w| {
+            w.set_enable(true);
+            w.set_key(CanVals::PwrenKey::KEY);
+        });
+        cortex_m::asm::delay(4000); // TODO: this should be calculated from MCLK at some point as 50us.
+
+        // again, not in reference manual and not required for other peripherals, but you need to now turn on the clock request signal.
+        can.ti_wrapper(0).msp(0).subsys_clken().write(|w| {
+            w.set_clk_reqen(true);
+        });
+
+        // Set a functional clock source - for now we only support HFCLK (HFXT or HFCLKIN).
+        can.ti_wrapper(0).msp(0).subsys_clkdiv().write(|w| {
+            w.set_ratio(match config.clock_div {
+                ClockDiv::DivBy1 => CanVals::Ratio::DIV_BY_1_,
+                ClockDiv::DivBy2 => CanVals::Ratio::DIV_BY_2_,
+                ClockDiv::DivBy4 => CanVals::Ratio::DIV_BY_4_
+            });
+        });
+
+        pac::SYSCTL.genclkcfg().modify(|w| {
+            w.set_canclksrc(pac::sysctl::vals::Canclksrc::HFCLK);
+        });
+
+        // Wait for async reset to be complete.
+        let mut iter = 0;
+        while can.ti_wrapper(0).processors(0).subsys_regs(0).subsys_stat().read().reset() {
+            if iter > 1000 {
+                return Err(InitializationError::PeripheralTimedOut);
+            }
+            iter += 1;
+            cortex_m::asm::delay(1000);
+        }
+
+        // Wait for "memory initialization" to be complete. I think this is zeroing the internal message RAM.
+        iter = 0;
+        while can.ti_wrapper(0).processors(0).subsys_regs(0).subsys_stat().read().mem_init_done() {
+            if iter > 1000 {
+                return Err(InitializationError::PeripheralTimedOut);
+            }
+            iter += 1;
+            cortex_m::asm::delay(1000);
+        }
+
+        // Sanity check the peripheral came up correctly by reading the release version register.
+        let crel = can.mcan(0).crel().read();
+        if crel.0 == 0x00 {
+            return Err(InitializationError::PeripheralTimedOut);
+        }
+        debug!("MCAN version: {}.{}.{} - {}{}{}", crel.rel(), crel.step(), crel.substep(), crel.year(), crel.mon(), crel.day());
+
+        Ok(())
+    }
+
+    /// Helper function to access write-protected peripheral registers.
+    /// Note that while these registers are writable, the peripheral is disconnected from the bus,
+    /// and won't send or receive frames, acks, or errors.
+    /// If the closure returns with an error, the peripheral will _not_ be placed back into "Normal" mode
+    /// as it may be in an inconsistent state.
+    fn guarded_config<T: Instance> (_peri: &Peri<'d, T>, f: impl FnOnce(&Regs) -> Result<(), InitializationError> ) -> Result<(), InitializationError> {
+        let can = T::info().regs;
+
+        // Put the peripheral into "initialization" mode as a first step to allow register changes.
+        can.mcan(0).cccr().modify(|w| {
+            w.set_init(true);
+        });
+
+        // This goes through clock domain crossings, so make sure it's actually in initialization mode.
+        let mut iter = 0;
+        while !can.mcan(0).cccr().read().init() {
+            if iter > 10000 {
+                return Err(InitializationError::PeripheralTimedOut);
+            }
+            iter += 1;
+            cortex_m::asm::delay(10);
+        }
+
+        // Now we can set the configuration change enabled bit to unlock registers.
+        can.mcan(0).cccr().modify(|w| {
+            w.set_cce(true);
+        });
+
+        if let Err(e) = f(&can) {
+            Err(e)
+        } else {
+            // re-enter normal state - disable changes, then disable init mode.
+            can.mcan(0).cccr().modify(|w| {
+                w.set_cce(false);
+            });
+            can.mcan(0).cccr().modify(|w| {
+                w.set_init(false);
+            });
+
+            iter = 0;
+            while can.mcan(0).cccr().read().init() {
+                if iter > 10000 {
+                    return Err(InitializationError::PeripheralTimedOut);
+                }
+                iter += 1;
+                cortex_m::asm::delay(10);
+            }
+
+            Ok(())
+        }
+
+        
+
+    }
+
     fn new_inner<T: Instance> (
-        _peri: Peri<'d, T>,
+        peri: Peri<'d, T>,
         rx: Peri<'d, impl RxPin<T>>,
-        tx: Peri<'d, impl RxPin<T>>,
-        mut config: Config
+        tx: Peri<'d, impl TxPin<T>>,
+        config: Config
     ) -> Result<Self, InitializationError> {
 
         // Note: use new_pin! when in tree.
-        
-        Err(InitializationError::ClockSourceNotEnabled)
+        let rx_inner = new_pin!(rx, PfType::input(crate::gpio::Pull::None, false));
+        let tx_inner = new_pin!(tx, PfType::output(crate::gpio::Pull::None, false));
+
+        // Reset and power on the CAN peripheral. Note this _is_ a falliable operation.
+        Self::reset_poweron(&peri, &config)?;
+    
+        Self::guarded_config(&peri, |can| -> Result<(), InitializationError> {
+            can.mcan(0).cccr().modify(|w| {
+                w.set_fdoe(false); // classic CAN, no FD.
+            });
+
+            // Nominal bit-timing (no CAN-FD support yet, so we do not configure data bit timing)
+            can.mcan(0).nbtp().write(|w| {
+                // Docs state that the hardware will actually use 1 greater than the value set in the register, so subtract one here.
+                w.set_nbrp(config.timing.brp - 1);
+
+                w.set_ntseg1(config.timing.ntseg1 as u8 - 1); 
+                w.set_ntseg2(config.timing.ntseg2 - 1);
+
+                w.set_nsjw(config.timing.sjw - 1);
+            });
+
+            // Global filter configuration
+            // Detailed filtering configuration will be follow-up work.
+            // For now, we will accept all frames into RX FIFO 0.
+            can.mcan(0).gfc().write(|w| {
+                w.set_anfs(0b00); // Accept non-matching 11-bit id frames into RX FIFO 0.
+                if config.accept_remote_frames {
+                    w.set_anfe(0b00); // Accept extended frames.
+                } else {
+                    w.set_anfe(0b10); // Reject extended frames.
+                }
+                w.set_rrfs(!config.accept_remote_frames ); // Reject remote frames with 11-bit IDs?
+                w.set_rrfe(!(config.accept_remote_frames && config.accept_extended_ids)); // reject remote frames with extended IDs?
+            });
+
+            // Message RAM sizing configuration goes here :)
+
+            Ok(())
+        })?;
+
+        Ok(Can {
+            info: T::info(),
+            state: T::state(),
+            rx: rx_inner,
+            tx: tx_inner,
+            _phantom: PhantomData
+        })
     }
 }
 
