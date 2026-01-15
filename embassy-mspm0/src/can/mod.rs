@@ -11,6 +11,8 @@ use crate::pac::{self};
 
 use embassy_sync::waitqueue::AtomicWaker;
 
+mod msgram;
+
 pub(crate) struct Info { // metadata/details about the specific instance of the peripheral in use.
     pub(crate) regs: Regs, // the registers for this specific instance
     pub(crate) interrupt: Interrupt, // which interrupt applies to this peripheral
@@ -143,7 +145,6 @@ impl<'d> Can<'d, Blocking> {
         tx: Peri<'d, impl TxPin<T>>,
         config: Config
     ) -> Result<Self, InitializationError> {
-
         Self::new_inner(peri, rx, tx, config)
     }
 }
@@ -156,6 +157,10 @@ impl<'d, M: Mode> Can<'d, M> {
         // If you do not wait >= 50us before accessing peripheral registers for the first time (or trying to enable clock) after enabling power,
         // the peripheral will lock up and only ever return zeros until reset via sysrst.
         let can = T::info().regs;
+
+        let mut hdr = msgram::RxHeader0(10);
+        
+        
 
         can.rstctl().write(|w| {
             w.set_resetstkyclr(true);
