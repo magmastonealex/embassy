@@ -72,6 +72,7 @@ micromath = "2.0.0"
 #mspm0-metapac = { git = "https://github.com/mspm0-rs/mspm0-data-generated/", tag = "mspm0-data-e91edd86813aa94cbb6737d34e4f1d22b8487cb6" }
 mspm0-metapac = { path = "/home/alex/mspm0-data/build/mspm0-metapac/" }
 bitfield = "0.19.4"
+embedded-can = "0.4.1"
 
 [build-dependencies]
 proc-macro2 = "1.0.94"

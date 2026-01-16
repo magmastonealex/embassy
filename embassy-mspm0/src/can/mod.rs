@@ -1,8 +1,11 @@
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_hal_internal::PeripheralType;
 
 use crate::Peri;
+use crate::can::frame::MCanFrame;
+use crate::can::msgram::{MessageRAMAccess, McanMessageRAM};
 use crate::gpio::{AnyPin, PfType};
 use crate::interrupt::Interrupt;
 use crate::mode::{Blocking, Mode};
@@ -13,14 +16,18 @@ use embassy_sync::waitqueue::AtomicWaker;
 
 mod msgram;
 
+pub mod frame;
+
 pub(crate) struct Info { // metadata/details about the specific instance of the peripheral in use.
     pub(crate) regs: Regs, // the registers for this specific instance
     pub(crate) interrupt: Interrupt, // which interrupt applies to this peripheral
+    mem: MessageRAMAccess
 }
 
 pub(crate) struct State {
     // waker for when interesting things happen, I guess.
     pub(crate) waker: AtomicWaker,
+    current_marker: AtomicU8
 }
 
 // prevent external callers from creating instances of this.
@@ -46,6 +53,10 @@ impl SealedInstance for crate::peripherals::CANFD0 {
         const INFO: Info = Info {
             regs: crate::pac::CANFD0,
             interrupt: crate::interrupt::typelevel::CANFD0::IRQ,
+            // mild voodoo - message RAM lives at the beginning of the address space of the MCAN peripheral, in a gap in the
+            // SVD between the base address and first documented register.
+            // Re-use the same register base address.
+            mem: unsafe { MessageRAMAccess::from_ptr( crate::pac::CANFD0.as_ptr() )}
         };
 
         &INFO
@@ -53,7 +64,8 @@ impl SealedInstance for crate::peripherals::CANFD0 {
 
     fn state() -> &'static State {
         static STATE: State = State {
-            waker: AtomicWaker::new()
+            waker: AtomicWaker::new(),
+            current_marker: AtomicU8::new(0)
         };
 
         &STATE
@@ -133,8 +145,8 @@ pub enum InitializationError {
 pub struct Can<'d, M: Mode> {
     info: &'static Info,
     state: &'static State,
-    rx: Option<Peri<'d, AnyPin>>,
-    tx: Option<Peri<'d, AnyPin>>,
+    _rx: Option<Peri<'d, AnyPin>>,
+    _tx: Option<Peri<'d, AnyPin>>,
     _phantom: PhantomData<M>,
 }
 
@@ -147,6 +159,93 @@ impl<'d> Can<'d, Blocking> {
     ) -> Result<Self, InitializationError> {
         Self::new_inner(peri, rx, tx, config)
     }
+
+    pub fn get_frame(&mut self) -> MCanFrame {
+        let fifo_status = self.info.regs.mcan(0).rxf0s();
+
+        // wait until an element becomes available.
+        let read_index = loop {
+            let cur_status = fifo_status.read();
+            if cur_status.f0gi() != cur_status.f0pi() {
+                // there is at least one item to read!
+                break cur_status.f0gi();
+            }
+            cortex_m::asm::delay(10);
+        };
+
+        // actually read the element.
+        let element = self.info.mem.get_rx_fifo_element(read_index as usize).expect("invalid read index - bad peripheral config?");
+
+        // mark the element as acknowledged.
+        self.info.regs.mcan(0).rxf0a().write(|w| {
+            w.set_f0ai(read_index);
+        });
+
+        element.into()
+    }
+
+    pub fn send_frame(&mut self, frame: MCanFrame) {
+        let fifo_status = self.info.regs.mcan(0).txfqs();
+
+        // TODO: how does concurrency control work here? Confirm two tasks can't execute this at the same time.
+        let write_index = loop {
+            let cur_status = fifo_status.read();
+            // If TX fifo put index == 
+            if cur_status.tfqf() {
+                // TX queue is full already.
+                cortex_m::asm::delay(10);
+            }
+            break cur_status.tfqp();
+        };
+
+        // convert our frame.
+        // Note: this is unsafe and should be replaced with a mutex or similar to track frame #s. I don't care at the moment
+        // and just want to get this to work.
+        //let new_marker = self.state.current_marker.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let new_marker = self.state.current_marker.load(Ordering::Relaxed);
+        self.state.current_marker.store(new_marker.wrapping_add(1), Ordering::Relaxed);
+        
+        let txbuf = frame.into_tx_buffer(Some(new_marker));
+
+        self.info.mem.set_tx_element(write_index as usize, txbuf).expect("invalid write index - bad periph config?");
+
+        // tell the peripheral we've written a new entry into the TX FIFO.
+        self.info.regs.mcan(0).txbar().write(|w| { 
+            w.0 = 1 << write_index;
+        });
+
+        defmt::info!("enqueued");
+        // This is sketchy and will stop working in any async scenario, but for now, spin on the TX Event FIFO until we have some evidence our frame was sent.
+        // I think this also will block forever if we get a bus-off or other failure. We need another way to track frames which we've enqueued but never got sent off.
+
+        // Major TODOs still:
+        // 1. Concurrency here is super sketch still - do we need to worry about reentrancy at all? Unclear to me.
+        // 2. Fix up the msgram mut thingy in the macro and figure out a better concurrency strategy for the marker #.
+        // 3. Actually implement the traits :)
+        // 4. Add tests to msgram and frame to confirm correct construction.
+        // 5. Tidy up the warnings everywhere.
+
+        let fifo_status = self.info.regs.mcan(0).txefs();
+        let read_index = loop {
+            let cur_status = fifo_status.read();
+            if cur_status.efgi() != cur_status.efpi() {
+                // there is at least one item to read!
+                break cur_status.efgi();
+            }
+            cortex_m::asm::delay(10);
+        };
+
+        // actually read the element.
+        let element = self.info.mem.get_tx_event(read_index as usize).expect("invalid read index - bad peripheral config?");
+
+        // mark the element as acknowledged.
+        self.info.regs.mcan(0).txefa().write(|w| {
+            w.set_efai(read_index);
+        });
+
+        defmt::info!("sent: {}", element.event.mm());
+
+    }
 }
 
 impl<'d, M: Mode> Can<'d, M> {
@@ -157,9 +256,6 @@ impl<'d, M: Mode> Can<'d, M> {
         // If you do not wait >= 50us before accessing peripheral registers for the first time (or trying to enable clock) after enabling power,
         // the peripheral will lock up and only ever return zeros until reset via sysrst.
         let can = T::info().regs;
-
-        let mut hdr = msgram::RxHeader0(10);
-        
         
 
         can.rstctl().write(|w| {
@@ -279,9 +375,6 @@ impl<'d, M: Mode> Can<'d, M> {
 
             Ok(())
         }
-
-        
-
     }
 
     fn new_inner<T: Instance> (
@@ -315,11 +408,11 @@ impl<'d, M: Mode> Can<'d, M> {
             });
 
             // Global filter configuration
-            // Detailed filtering configuration will be follow-up work.
+            // Filtering configuration will be follow-up work.
             // For now, we will accept all frames into RX FIFO 0.
             can.mcan(0).gfc().write(|w| {
                 w.set_anfs(0b00); // Accept non-matching 11-bit id frames into RX FIFO 0.
-                if config.accept_remote_frames {
+                if config.accept_extended_ids {
                     w.set_anfe(0b00); // Accept extended frames.
                 } else {
                     w.set_anfe(0b10); // Reject extended frames.
@@ -328,7 +421,63 @@ impl<'d, M: Mode> Can<'d, M> {
                 w.set_rrfe(!(config.accept_remote_frames && config.accept_extended_ids)); // reject remote frames with extended IDs?
             });
 
-            // Message RAM sizing configuration goes here :)
+            // Sizing for message RAM.
+
+            // Standard filters
+            can.mcan(0).sidfc().write(|w| {
+                w.set_lss(McanMessageRAM::SIZES.filters as u8);
+                w.set_flssa(McanMessageRAM::OFFSETS.filters as u16);
+            });
+
+            // 29 bit filters
+            can.mcan(0).xidfc().write(|w| {
+                w.set_lse(McanMessageRAM::SIZES.extended_filters as u8);
+                w.set_flesa(McanMessageRAM::OFFSETS.extended_filters as u16);
+            });
+
+            // RX FIFO 0
+            can.mcan(0).rxf0c().write(|w| {
+                w.set_f0om(false); // blocking mode - don't overwrite messages.
+                w.set_f0wm(0); // no watermark.
+                w.set_f0s(McanMessageRAM::SIZES.rxfifo0 as u8);
+                w.set_f0sa(McanMessageRAM::OFFSETS.rxfifo0 as u16);
+            });
+
+            // RX FIFO 1
+            can.mcan(0).rxf1c().write(|w| {
+                w.set_f1om(false); // blocking mode - don't overwrite.
+                w.set_f1wm(0); // no watermark.
+                w.set_f1s(McanMessageRAM::SIZES.rxfifo1 as u8);
+                w.set_f1sa(McanMessageRAM::OFFSETS.rxfifo1 as u16);
+            });
+
+            // RX Buffers
+            can.mcan(0).rxbc().write(|w| {
+                w.set_rbsa(McanMessageRAM::OFFSETS.rxbuffers as u16);
+            });
+            // Sizes for various RX elements.
+            can.mcan(0).rxesc().write(|w| {
+                w.set_rbds(0); // 8 byte max data in RX buffers.
+                w.set_f1ds(0); // 8 byte max data in RX fifo 1.
+                w.set_f0ds(0); // 8 byte max data in RX fifo 0
+            });
+
+            // TX Event FIFO
+            can.mcan(0).txefc().write(|w| {
+                w.set_efsa(McanMessageRAM::OFFSETS.txevents as u16);
+                w.set_efs(McanMessageRAM::SIZES.txevents as u8);
+                w.set_efwm(0); // no watermark.
+            });
+            // TX Buffers
+            can.mcan(0).txbc().write(|w| {
+                w.set_tfqm(false); // FIFO operation mode, not priority queue.
+                w.set_ndtb(0); // No dedicated transmit buffers (not supported [yet?])
+                w.set_tfqs(McanMessageRAM::SIZES.txfifo as u8);
+                w.set_tbsa(McanMessageRAM::OFFSETS.txfifo as u16);
+            });
+            can.mcan(0).txesc().write(|w| {
+                w.set_tbds(0); // max 8 byte data payloads in TX elements.
+            });
 
             Ok(())
         })?;
@@ -336,12 +485,20 @@ impl<'d, M: Mode> Can<'d, M> {
         Ok(Can {
             info: T::info(),
             state: T::state(),
-            rx: rx_inner,
-            tx: tx_inner,
+            _rx: rx_inner,
+            _tx: tx_inner,
             _phantom: PhantomData
         })
     }
+
+    pub fn has_frame(&self) -> bool {
+        let cur_status = self.info.regs.mcan(0).rxf0s().read();
+        return cur_status.f0gi() != cur_status.f0pi();
+    }
+
 }
+
+
 
 // RX and TX pin traits - normally constructed via a macro, we'll do it manually to demonstrate functionality.
 // These are effectively sealed because pf_num isn't public so can't be implemented by anyone else.
