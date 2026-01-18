@@ -423,8 +423,18 @@ macro_rules! impl_ram_access {
     };
 
     (@gen_setter $field:ident, $setter:ident, $el_type:ty) => {
-        // HACK - this should really be &mut self.
-        // TODO: fix this :)
+        // Note that this setter takes a non-mutable reference yet does mutate data.
+        // The PACs do the same thing - a writable Reg has a function: 
+        // `pub fn write_value(&self, val: T)`
+        // which effectively ignores ownership rules.
+        //
+        // This is following the same pattern, because this module is effectively doing the same job as the PAC,
+        // (offering access to MMIO registers), but can't be directly included in the PAC as the offsets, sizes,
+        // etc are configurable which doesn't seem to be something that chiptool/svd2rust can really support code-gen wise.
+        //
+        // We'll be super careful inside of these unsafe blocks to do the right thing, but we will ignore ownership rules
+        // just like the PAC does - it's up to the rest of the HAL to use this with great caution and expose a truly sound
+        // API to consumers.
         pub fn $setter(&self, idx: usize, val: $el_type) -> Option<()> {
             unsafe {
                 // type check.
@@ -451,14 +461,10 @@ impl MessageRAMAccess {
     pub const unsafe fn from_ptr(ptr: *mut ()) -> Self {
         Self { ptr: ptr as _ }
     }
-    #[inline(always)]
-    pub const fn as_ptr(&self) -> *mut () {
-        self.ptr as _
-    }
 
     impl_ram_access!(rxfifo0, get_rx_fifo_element, _, RxBufferElement);
-    impl_ram_access!(txfifo0, get_tx_element, set_tx_element, TxBufferElement);
-    impl_ram_access!(txevents, get_tx_event, set_tx_event, TxEventElement);
+    impl_ram_access!(txfifo0, _, set_tx_element, TxBufferElement);
+    impl_ram_access!(txevents, get_tx_event, _, TxEventElement);
 }
 
 #[cfg(test)]

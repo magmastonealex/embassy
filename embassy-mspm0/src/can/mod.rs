@@ -160,6 +160,8 @@ impl<'d> Can<'d, Blocking> {
         Self::new_inner(peri, rx, tx, config)
     }
 
+    // this is fundamentally mutable - after all, we're changing something within the peripheral!
+    // As such, we shouldn
     pub fn get_frame(&mut self) -> MCanFrame {
         let fifo_status = self.info.regs.mcan(0).rxf0s();
 
