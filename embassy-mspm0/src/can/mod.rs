@@ -18,6 +18,18 @@ mod msgram;
 
 pub mod frame;
 
+// Major TODOs still:
+// 1. Concurrency here _feels_ sketchy and needs a good review. Remember the PAC and msgram purposefully disable borrow checker protections against simultaneous access.
+// 2. figure out a better concurrency strategy for the marker # (though note it's not actually _needed_ right now.)
+// 3. Actually implement the trait instead of using the half-implementations we have now :)
+//    -> Note the trait actually has no provision for confirming frames were actually sent, so the TX event FIFO is not required.
+// 4. do _something_ to handle bus-off and other protocol errors. It's not clear to me yet what the right interface is for that. Probably involves a config to decide how to handle bus-off / error-passive?
+//    -> can simulate by setting invalid bitrate, maybe?
+// 5. Write a little test jig to ping things back and forth in various situations to prove things are working
+// X. Add tests to msgram and frame to confirm correct construction (done?)
+// 5. Docs!
+// 6. Bit rate calculations & accompanying tests.
+
 pub(crate) struct Info { // metadata/details about the specific instance of the peripheral in use.
     pub(crate) regs: Regs, // the registers for this specific instance
     pub(crate) interrupt: Interrupt, // which interrupt applies to this peripheral
@@ -168,7 +180,7 @@ impl<'d> Can<'d, Blocking> {
         // wait until an element becomes available.
         let read_index = loop {
             let cur_status = fifo_status.read();
-            if cur_status.f0gi() != cur_status.f0pi() {
+            if cur_status.f0gi() != cur_status.f0pi() || cur_status.f0f() {
                 // there is at least one item to read!
                 break cur_status.f0gi();
             }
@@ -193,11 +205,12 @@ impl<'d> Can<'d, Blocking> {
         let write_index = loop {
             let cur_status = fifo_status.read();
             // If TX fifo put index == 
-            if cur_status.tfqf() {
+            if !cur_status.tfqf() {
                 // TX queue is full already.
-                cortex_m::asm::delay(10);
+                break cur_status.tfqp();
             }
-            break cur_status.tfqp();
+            cortex_m::asm::delay(10);
+            continue;
         };
 
         // convert our frame.
@@ -216,21 +229,13 @@ impl<'d> Can<'d, Blocking> {
             w.0 = 1 << write_index;
         });
 
-        defmt::info!("enqueued");
         // This is sketchy and will stop working in any async scenario, but for now, spin on the TX Event FIFO until we have some evidence our frame was sent.
         // I think this also will block forever if we get a bus-off or other failure. We need another way to track frames which we've enqueued but never got sent off.
-
-        // Major TODOs still:
-        // 1. Concurrency here is super sketch still - do we need to worry about reentrancy at all? Unclear to me.
-        // 2. Fix up the msgram mut thingy in the macro and figure out a better concurrency strategy for the marker #.
-        // 3. Actually implement the traits :)
-        // 4. Add tests to msgram and frame to confirm correct construction.
-        // 5. Tidy up the warnings everywhere.
 
         let fifo_status = self.info.regs.mcan(0).txefs();
         let read_index = loop {
             let cur_status = fifo_status.read();
-            if cur_status.efgi() != cur_status.efpi() {
+            if cur_status.efgi() != cur_status.efpi() || cur_status.eff() {
                 // there is at least one item to read!
                 break cur_status.efgi();
             }
@@ -245,8 +250,7 @@ impl<'d> Can<'d, Blocking> {
             w.set_efai(read_index);
         });
 
-        defmt::info!("sent: {}", element.event.mm());
-
+        assert!(element.event.mm() == new_marker);
     }
 }
 
@@ -495,7 +499,7 @@ impl<'d, M: Mode> Can<'d, M> {
 
     pub fn has_frame(&self) -> bool {
         let cur_status = self.info.regs.mcan(0).rxf0s().read();
-        return cur_status.f0gi() != cur_status.f0pi();
+        cur_status.f0gi() != cur_status.f0pi() || cur_status.f0f()
     }
 
 }

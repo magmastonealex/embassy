@@ -2,7 +2,7 @@ use bitfield::bitfield;
 
 /// Maximum data allowed in RX or TX frames.
 /// This is currently fixed at 8, as the driver does not support CAN-FD right now anyways.
-const DATA_LEN: usize = 8;
+pub const MAX_DATA_LEN: usize = 8;
 
 /// How many elements will be in the RX FIFO?
 /// (Note: This simple driver supports only a single RX FIFO at this point - other FIFOs will have zero size.)
@@ -75,6 +75,7 @@ bitfield! {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
+#[allow(dead_code)]
 pub(super) enum EventType {
     Unknown = 0x00,
     TxEvent = 0x01,
@@ -267,7 +268,7 @@ pub(super) struct RxBufferElement {
     // a bit awkward to split this into two structs, but this is hidden from downstream consumers anyways.
     pub hdr: MsgHeader,
     pub rxhdr: RxHeader,
-    pub data: [u8; DATA_LEN]
+    pub data: [u8; MAX_DATA_LEN]
 }
 
 impl Default for RxBufferElement {
@@ -275,7 +276,7 @@ impl Default for RxBufferElement {
         Self {
             hdr: MsgHeader(0),
             rxhdr: RxHeader(0),
-            data: [0u8; DATA_LEN]
+            data: [0u8; MAX_DATA_LEN]
         }
     }
 }
@@ -287,7 +288,7 @@ pub(super) struct TxBufferElement {
     // a bit awkward to split this into two structs, but this is hidden from downstream consumers anyways.
     pub hdr: MsgHeader,
     pub txhdr: TxHeader,
-    pub data: [u8; DATA_LEN]
+    pub data: [u8; MAX_DATA_LEN]
 }
 
 impl Default for TxBufferElement {
@@ -295,7 +296,7 @@ impl Default for TxBufferElement {
         Self {
             hdr: MsgHeader(0),
             txhdr: TxHeader(0),
-            data: [0u8; DATA_LEN]
+            data: [0u8; MAX_DATA_LEN]
         }
     }
 }
