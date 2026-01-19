@@ -8,7 +8,7 @@ pub const MAX_DATA_LEN: usize = 8;
 /// (Note: This simple driver supports only a single RX FIFO at this point - other FIFOs will have zero size.)
 const NUM_RX_ELEMENTS: usize = 10;
 const NUM_TX_ELEMENTS: usize = 5;
-const NUM_TX_EVENTS: usize = 5;
+const NUM_TX_EVENTS: usize = 0; // currently unused as embedded-can traits do not require confirmation yet.
 
 bitfield! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -465,7 +465,6 @@ impl MessageRAMAccess {
 
     impl_ram_access!(rxfifo0, get_rx_fifo_element, _, RxBufferElement);
     impl_ram_access!(txfifo0, _, set_tx_element, TxBufferElement);
-    impl_ram_access!(txevents, get_tx_event, _, TxEventElement);
 }
 
 #[cfg(test)]

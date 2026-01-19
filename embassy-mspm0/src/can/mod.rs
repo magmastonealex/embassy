@@ -1,5 +1,4 @@
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU8, Ordering};
 
 use embassy_hal_internal::PeripheralType;
 
@@ -20,7 +19,7 @@ pub mod frame;
 
 // Major TODOs still:
 // 1. Concurrency here _feels_ sketchy and needs a good review. Remember the PAC and msgram purposefully disable borrow checker protections against simultaneous access.
-// 2. Rip out marker # and TX event details for now - not needed right now.
+// X. Rip out marker # and TX event details for now - not needed right now.
 // 3. Actually implement the trait instead of using the half-implementations we have now :)
 //    -> Note the trait actually has no provision for confirming frames were actually sent, so the TX event FIFO is not required.
 //    -> The trait also does not implement true async! We may want to provide those anyways?
@@ -31,6 +30,7 @@ pub mod frame;
 // X. Add tests to msgram and frame to confirm correct construction (done?)
 // 5. Docs!
 // 6. Bit rate calculations & accompanying tests.
+//    -> Defer to later.
 // 7. Pin / peripheral macros.
 // At least 
 
@@ -43,7 +43,6 @@ pub(crate) struct Info { // metadata/details about the specific instance of the 
 pub(crate) struct State {
     // waker for when interesting things happen, I guess.
     pub(crate) waker: AtomicWaker,
-    current_marker: AtomicU8
 }
 
 // prevent external callers from creating instances of this.
@@ -80,8 +79,7 @@ impl SealedInstance for crate::peripherals::CANFD0 {
 
     fn state() -> &'static State {
         static STATE: State = State {
-            waker: AtomicWaker::new(),
-            current_marker: AtomicU8::new(0)
+            waker: AtomicWaker::new()
         };
 
         &STATE
@@ -264,7 +262,6 @@ impl<'d> Can<'d, Blocking> {
     pub fn send_frame(&mut self, frame: MCanFrame) {
         let fifo_status = self.info.regs.mcan(0).txfqs();
 
-        // TODO: how does concurrency control work here? Confirm two tasks can't execute this at the same time.
         let write_index = loop {
             let cur_status = fifo_status.read();
             // If TX fifo put index == 
@@ -277,13 +274,9 @@ impl<'d> Can<'d, Blocking> {
         };
 
         // convert our frame.
-        // Note: this is unsafe and should be replaced with a mutex or similar to track frame #s. I don't care at the moment
-        // and just want to get this to work.
-        //let new_marker = self.state.current_marker.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let new_marker = self.state.current_marker.load(Ordering::Relaxed);
-        self.state.current_marker.store(new_marker.wrapping_add(1), Ordering::Relaxed);
         
-        let txbuf = frame.into_tx_buffer(Some(new_marker));
+        // we do not use tx events at this time.
+        let txbuf = frame.into_tx_buffer(None);
 
         self.info.mem.set_tx_element(write_index as usize, txbuf).expect("invalid write index - bad periph config?");
 
@@ -291,29 +284,6 @@ impl<'d> Can<'d, Blocking> {
         self.info.regs.mcan(0).txbar().write(|w| { 
             w.0 = 1 << write_index;
         });
-
-        // This is sketchy and will stop working in any async scenario, but for now, spin on the TX Event FIFO until we have some evidence our frame was sent.
-        // I think this also will block forever if we get a bus-off or other failure. We need another way to track frames which we've enqueued but never got sent off.
-
-        let fifo_status = self.info.regs.mcan(0).txefs();
-        let read_index = loop {
-            let cur_status = fifo_status.read();
-            if cur_status.efgi() != cur_status.efpi() || cur_status.eff() {
-                // there is at least one item to read!
-                break cur_status.efgi();
-            }
-            cortex_m::asm::delay(10);
-        };
-
-        // actually read the element.
-        let element = self.info.mem.get_tx_event(read_index as usize).expect("invalid read index - bad peripheral config?");
-
-        // mark the element as acknowledged.
-        self.info.regs.mcan(0).txefa().write(|w| {
-            w.set_efai(read_index);
-        });
-
-        assert!(element.event.mm() == new_marker);
     }
 }
 
@@ -565,7 +535,6 @@ impl<'d, M: Mode> Can<'d, M> {
         let cur_status = self.info.regs.mcan(0).rxf0s().read();
         cur_status.f0gi() != cur_status.f0pi() || cur_status.f0f()
     }
-
 
     fn reg_to_error(value: u8) -> Option<BusError> {
         match value {
