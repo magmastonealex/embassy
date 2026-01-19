@@ -20,15 +20,19 @@ pub mod frame;
 
 // Major TODOs still:
 // 1. Concurrency here _feels_ sketchy and needs a good review. Remember the PAC and msgram purposefully disable borrow checker protections against simultaneous access.
-// 2. figure out a better concurrency strategy for the marker # (though note it's not actually _needed_ right now.)
+// 2. Rip out marker # and TX event details for now - not needed right now.
 // 3. Actually implement the trait instead of using the half-implementations we have now :)
 //    -> Note the trait actually has no provision for confirming frames were actually sent, so the TX event FIFO is not required.
+//    -> The trait also does not implement true async! We may want to provide those anyways?
 // 4. do _something_ to handle bus-off and other protocol errors. It's not clear to me yet what the right interface is for that. Probably involves a config to decide how to handle bus-off / error-passive?
+//    -> Config has been added, and functions for manually polling and recoverying have been added.
 //    -> can simulate by setting invalid bitrate, maybe?
 // 5. Write a little test jig to ping things back and forth in various situations to prove things are working
 // X. Add tests to msgram and frame to confirm correct construction (done?)
 // 5. Docs!
 // 6. Bit rate calculations & accompanying tests.
+// 7. Pin / peripheral macros.
+// At least 
 
 pub(crate) struct Info { // metadata/details about the specific instance of the peripheral in use.
     pub(crate) regs: Regs, // the registers for this specific instance
@@ -89,14 +93,15 @@ impl Instance for crate::peripherals::CANFD0 {
 }
 
 
+/// Functional clock divider - consider this as an additional few bits on top of the bitrate prescaler if needed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ClockDiv {
-    // Do not divide clock source.
+    //. Do not divide clock source.
     DivBy1,
-    // Divide clock source by 2.
+    /// Divide clock source by 2.
     DivBy2,
-    // Divide clock source by 4.
+    /// Divide clock source by 4.
     DivBy4,
 }
 
@@ -105,17 +110,30 @@ pub enum ClockDiv {
 /// Structure to encode CAN timing parameter information.
 /// Note that the hardware adds '1' to each of the values placed in the registers of the peripheral.
 /// This crate handles this for you, so the values in this struct should be the actual values you wish to use.
+/// Strongly suggest using the from_bitrate function to determine values here.
 pub struct CanTimings {
-    brp: u16, /// Bitrate prescaler, valid values 1-512. 
-    sjw: u8, /// Sync Jump Width - valid values 1-128, though must also be <= ntseg2.
-    ntseg1: u16, // Segment 1 time. Valid values are 2-256
-    ntseg2: u8, // Segment 2 time. Valid values are 2-128.
+    pub brp: u16, /// Bitrate prescaler, valid values 1-512. 
+    pub sjw: u8, /// Sync Jump Width - valid values 1-128, though must also be <= ntseg2.
+    pub ntseg1: u16, // Segment 1 time. Valid values are 2-256
+    pub ntseg2: u8, // Segment 2 time. Valid values are 2-128.
 }
 
 impl CanTimings {
     pub const fn from_values(brp: u16, sjw: u8, ntseg1: u16, ntseg2: u8) -> Option<CanTimings> {
         Some(CanTimings { brp, sjw, ntseg1, ntseg2 })
     }
+}
+
+/// Error handling behaviour - 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BusOffHandling {
+    /// Auto Re-Init - when a bus-off condition is encountered, the peripheral will be restarted immediately.
+    AutoReInit,
+
+    // Manual Re-Init - The peripheral will be left in the bus-off state indefinitely.
+    // It is up to the consumer to regularly poll for status and call recover().
+    ManualReInit
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -128,6 +146,8 @@ pub struct Config {
 
     /// Input clock divider
     pub clock_div: ClockDiv,
+
+    pub bus_off_handling: BusOffHandling,
 
     /// CAN timings to use for standard CAN. (CAN-FD support to come later.)
     pub timing: CanTimings,
@@ -154,9 +174,52 @@ pub enum InitializationError {
     PeripheralTimedOut,
 }
 
+
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+/// Error status of the CAN peripheral
+pub enum BusError {
+    /// The peripheral has encountered enough receive errors that it has entered a passive state and will no longer send error frames.
+    ErrorPassive,
+
+    /// The transmit or receive error counters have reached a level that suggests something is wrong with the bus, but messages are still
+    /// being sent and received.
+    ErrorWarning,
+
+    /// The peripheral has disconnected from the bus as too many transmit errors were encountered.
+    BusOff,
+
+    /// More than 5 equal bits in a sequence have occurred in a part of a received message where this is not allowed.
+    Stuff,
+    ///A fixed format part of a received frame has the wrong format.
+    Form,
+    /// The message transmitted by the peripheral was not acknowledged by another node.
+    Acknowledge,
+    ///During the transmission of a message (with the exception of the arbitration field), the device wanted to send a recessive level (bit of logical value '1'), but the monitored bus value was dominant.
+    BitRecessive,
+    /// During the transmission of a message (or acknowledge bit, or active error flag, or overload flag), the device wanted to send a dominant level (data or identifier bit logical value '0'), but the monitored bus value was recessive.
+    /// This is also set during bus-off recovery for each sequence of 11 recessive bits and can be used to monitor recovery progress.
+    BitDominant,
+    ///The CRC check sum of a received message was incorrect. The CRC of an incoming message does not match with the CRC calculated from the received data.
+    Crc,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+/// Error status of the CAN peripheral
+pub enum RecoveryFailure {
+    /// The peripheral doesn't need to be recovered manually.
+    WasAutomatic,
+    /// The peripheral was not in bus-off state.
+    WasNotBusOff,
+}
+
 pub struct Can<'d, M: Mode> {
     info: &'static Info,
     state: &'static State,
+    config: Config,
     _rx: Option<Peri<'d, AnyPin>>,
     _tx: Option<Peri<'d, AnyPin>>,
     _phantom: PhantomData<M>,
@@ -491,6 +554,7 @@ impl<'d, M: Mode> Can<'d, M> {
         Ok(Can {
             info: T::info(),
             state: T::state(),
+            config,
             _rx: rx_inner,
             _tx: tx_inner,
             _phantom: PhantomData
@@ -502,7 +566,52 @@ impl<'d, M: Mode> Can<'d, M> {
         cur_status.f0gi() != cur_status.f0pi() || cur_status.f0f()
     }
 
+
+    fn reg_to_error(value: u8) -> Option<BusError> {
+        match value {
+            1 => Some(BusError::Stuff),
+            2 => Some(BusError::Form),
+            3 => Some(BusError::Acknowledge),
+            4 => Some(BusError::BitRecessive),
+            5 => Some(BusError::BitDominant),
+            6 => Some(BusError::Crc),
+            _ => None,
+        }
+    }
+
+    pub fn status(&self) -> Option<BusError> {
+        let status = self.info.regs.mcan(0).psr().read();
+        if status.bo() {
+            return Some(BusError::BusOff);
+        } else if status.ep() {
+            return Some(BusError::ErrorPassive);
+        } else if status.ew() {
+            return Some(BusError::ErrorWarning);
+        } else {
+            return Can::<M>::reg_to_error(status.lec())
+        }
+    }
+
+    /// Attempt to recover from a bus-off condition.
+    pub fn recover(&mut self) -> Result<(), RecoveryFailure> {
+        // Confirm we are in manual recovery mode (otherwise, ISR will handle this.)
+        if self.config.bus_off_handling != BusOffHandling::ManualReInit {
+            return Err(RecoveryFailure::WasAutomatic);
+        }
+        let mcan = self.info.regs.mcan(0);
+        // Confirm we're in bus-off state.
+        if !mcan.psr().read().bo() {
+            return Err(RecoveryFailure::WasNotBusOff);
+        }
+        // Set CCR.INIT = 0 to start recovery.
+        mcan.cccr().modify(|w| {
+            w.set_init(false);
+        });
+
+        Ok(())
+    }
 }
+
 
 
 
