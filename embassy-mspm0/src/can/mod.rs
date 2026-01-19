@@ -25,6 +25,7 @@ pub mod frame;
 // 3. Actually implement the trait instead of using the half-implementations we have now :)
 //    -> Note the trait actually has no provision for confirming frames were actually sent, so the TX event FIFO is not required.
 //    -> The trait also does not implement true async! We may want to provide those anyways?
+//    -> Move the Blocking methods to the parent. Implement the two traits for the Blocking type. Figure out how to retry.
 // 4. do _something_ to handle bus-off and other protocol errors. It's not clear to me yet what the right interface is for that. Probably involves a config to decide how to handle bus-off / error-passive?
 //    -> Config has been added, and functions for manually polling and recoverying have been added.
 //    -> can simulate by setting invalid bitrate, maybe?
@@ -33,7 +34,8 @@ pub mod frame;
 // 5. Docs!
 // 6. Bit rate calculations & accompanying tests.
 //    -> Defer to later.
-// 7. Pin / peripheral macros.
+// X. Pin / peripheral macros.
+//
 // 8. As discussed in matrix - configuration for syspll to start it from RC oscillator at 32MHz for now to avoid needing to do _too_ much extra clocking.
 
 pub(crate) struct Info { // metadata/details about the specific instance of the peripheral in use.
@@ -57,8 +59,6 @@ pub(crate) trait SealedInstance {
 pub trait Instance: SealedInstance + PeripheralType {
     type Interrupt: crate::interrupt::typelevel::Interrupt;
 }
-
-
 
 /// Functional clock divider - consider this as an additional few bits on top of the bitrate prescaler if needed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -193,6 +193,9 @@ pub struct Can<'d, M: Mode> {
 }
 
 impl<'d> Can<'d, Blocking> {
+    /// The "Blocking" CAN instance actually implements both the blocking and non-blocking embedded-can traits.
+    /// the nb traits either work or do not and aren't actually async.
+    /// The Async version of this driver will offer options to properly handle asynchronous work.
     pub fn new_blocking<T: Instance> (
         peri: Peri<'d, T>,
         rx: Peri<'d, impl RxPin<T>>,
@@ -202,22 +205,13 @@ impl<'d> Can<'d, Blocking> {
         Self::new_inner(peri, rx, tx, config)
     }
 
-    // this is fundamentally mutable - after all, we're changing something within the peripheral!
-    // As such, we shouldn
-    pub fn get_frame(&mut self) -> MCanFrame {
-        let fifo_status = self.info.regs.mcan(0).rxf0s();
+    pub fn get_frame(&mut self) -> Option<MCanFrame> {
+        let cur_status = self.info.regs.mcan(0).rxf0s().read();
+        if cur_status.f0gi() == cur_status.f0pi() && !cur_status.f0f() {
+            return None;
+        }
+        let read_index = cur_status.f0gi();
 
-        // wait until an element becomes available.
-        let read_index = loop {
-            let cur_status = fifo_status.read();
-            if cur_status.f0gi() != cur_status.f0pi() || cur_status.f0f() {
-                // there is at least one item to read!
-                break cur_status.f0gi();
-            }
-            cortex_m::asm::delay(10);
-        };
-
-        // actually read the element.
         let element = self.info.mem.get_rx_fifo_element(read_index as usize).expect("invalid read index - bad peripheral config?");
 
         // mark the element as acknowledged.
@@ -225,34 +219,63 @@ impl<'d> Can<'d, Blocking> {
             w.set_f0ai(read_index);
         });
 
-        element.into()
+        Some(element.into())
     }
 
-    pub fn send_frame(&mut self, frame: MCanFrame) {
-        let fifo_status = self.info.regs.mcan(0).txfqs();
 
-        let write_index = loop {
-            let cur_status = fifo_status.read();
-            // If TX fifo put index == 
-            if !cur_status.tfqf() {
-                // TX queue is full already.
-                break cur_status.tfqp();
+    /// Retrieve a frame from the peripheral in a blocking fashion.
+    /// Will return a BusError if the peripheral enters bus-off state.
+    pub fn get_frame_blocking(&mut self) -> Result<MCanFrame, BusError> {
+        loop {
+            if let Some(frame) = self.get_frame() {
+                return Ok(frame);
             }
-            cortex_m::asm::delay(10);
-            continue;
-        };
+            
+            // BusOff will never recover by itself - bail so the caller can deal with this.
+            match self.status() {
+                Some(BusError::BusOff) => {return Err(BusError::BusOff)},
+                _ => {}
+            }
 
-        // convert our frame.
-        
-        // we do not use tx events at this time.
-        let txbuf = frame.into_tx_buffer(None);
+            cortex_m::asm::delay(100);
+        }
+    }
 
+    pub fn enqueue_frame(&mut self, frame: &MCanFrame) -> Option<()> {
+        let cur_status = self.info.regs.mcan(0).txfqs().read();
+        if cur_status.tfqf() {
+            // TX queue is full already.
+            // TODO: Consider trying to replace a lower-priority item in the future.
+            return None;
+        }
+
+
+        let txbuf = frame.to_tx_buffer(None); // note we do not support TX events yet.
+        let write_index = cur_status.tfqp();
         self.info.mem.set_tx_element(write_index as usize, txbuf).expect("invalid write index - bad periph config?");
 
         // tell the peripheral we've written a new entry into the TX FIFO.
-        self.info.regs.mcan(0).txbar().write(|w| { 
+        self.info.regs.mcan(0).txbar().write(|w| {
             w.0 = 1 << write_index;
         });
+
+        Some(())
+    }
+
+    pub fn enqueue_frame_blocking(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
+        loop {
+            if let Some(_) = self.enqueue_frame(frame) {
+                return Ok(());
+           }
+
+            // BusOff will never recover by itself - bail so the caller can deal with this.
+            match self.status() {
+                Some(BusError::BusOff) => {return Err(BusError::BusOff)},
+                _ => {}
+            }
+
+            cortex_m::asm::delay(100);
+        }
     }
 }
 

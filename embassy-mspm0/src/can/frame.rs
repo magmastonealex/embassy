@@ -109,7 +109,7 @@ impl MCanFrame {
     /// Convert this MCanFrame into a TXBufferElement ready for transmission.
     /// If msgid is None, then the EFC field will not be set and no confirmation will
     /// be sent to the event FIFO.
-    pub(in crate::can) fn into_tx_buffer(self, marker: Option<u8>) -> TxBufferElement {
+    pub(in crate::can) fn to_tx_buffer(&self, marker: Option<u8>) -> TxBufferElement {
         let mut glblheader = MsgHeader(0);
         
         glblheader.set_rtr(self.is_remote);
@@ -152,7 +152,7 @@ mod test {
         let frame = MCanFrame::new(id, &data).expect("Frame creation failed");
 
         // Test with a marker (event FIFO enabled)
-        let tx_element = frame.into_tx_buffer(Some(0xAA));
+        let tx_element = frame.to_tx_buffer(Some(0xAA));
 
         // Standard IDs must be shifted 18 bits left in the M_CAN message RAM format
         assert_eq!(tx_element.hdr.id(), (0x7FF << 18));
@@ -172,7 +172,7 @@ mod test {
         let frame = MCanFrame::new(id, &data).expect("Frame creation failed");
 
         // Test without a marker (event FIFO disabled)
-        let tx_element = frame.into_tx_buffer(None);
+        let tx_element = frame.to_tx_buffer(None);
 
         // Extended IDs are stored as-is
         assert_eq!(tx_element.hdr.id(), 0x1234567);
@@ -189,7 +189,7 @@ mod test {
 
         let frame = MCanFrame::new_remote(id, 8).expect("Remote frame creation failed");
 
-        let tx_element = frame.into_tx_buffer(None);
+        let tx_element = frame.to_tx_buffer(None);
 
         assert!(tx_element.hdr.rtr());
         assert_eq!(tx_element.txhdr.dlc(), 8);
@@ -202,7 +202,7 @@ mod test {
         let id = Id::Standard(StandardId::new(0x123).unwrap());
         let frame_empty = MCanFrame::new(id, &[]).unwrap();
         assert_eq!(frame_empty.dlc(), 0);
-        assert_eq!(frame_empty.into_tx_buffer(None).txhdr.dlc(), 0);
+        assert_eq!(frame_empty.to_tx_buffer(None).txhdr.dlc(), 0);
 
         // Test max-length data (8 bytes)
         let data = [0xFF; 8];
