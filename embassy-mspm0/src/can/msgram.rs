@@ -454,7 +454,7 @@ macro_rules! impl_ram_access {
 }
 
 /// register/pac-like access to MessageRAM at a specific address.
-pub(super) struct MessageRAMAccess {
+pub(crate) struct MessageRAMAccess {
     ptr: *mut McanMessageRAM
 }
 impl MessageRAMAccess {

@@ -1,3 +1,5 @@
+#![macro_use]
+
 use core::marker::PhantomData;
 
 use embassy_hal_internal::PeripheralType;
@@ -13,7 +15,7 @@ use crate::pac::{self};
 
 use embassy_sync::waitqueue::AtomicWaker;
 
-mod msgram;
+pub(crate) mod msgram;
 
 pub mod frame;
 
@@ -32,12 +34,12 @@ pub mod frame;
 // 6. Bit rate calculations & accompanying tests.
 //    -> Defer to later.
 // 7. Pin / peripheral macros.
-// At least 
+// 8. As discussed in matrix - configuration for syspll to start it from RC oscillator at 32MHz for now to avoid needing to do _too_ much extra clocking.
 
 pub(crate) struct Info { // metadata/details about the specific instance of the peripheral in use.
     pub(crate) regs: Regs, // the registers for this specific instance
     pub(crate) interrupt: Interrupt, // which interrupt applies to this peripheral
-    mem: MessageRAMAccess
+    pub(crate) mem: MessageRAMAccess
 }
 
 pub(crate) struct State {
@@ -56,39 +58,6 @@ pub trait Instance: SealedInstance + PeripheralType {
     type Interrupt: crate::interrupt::typelevel::Interrupt;
 }
 
-// provide all of the details we need to use the CANFD0 peripheral.
-// We would need another one of these for CANFD1, etc. which is why macros are usually used.
-impl SealedInstance for crate::peripherals::CANFD0 {
-    fn info() -> &'static Info {
-        // too many types named Interrupt. There's an impl ... somewhere? in generated code impl Interrupt for CANFD0 which provides the IRQ constant enum value,
-        // which we then use to reference the actual interrupt channel in other methods.
-        // The type usage here is quite confusing to me.
-        use crate::interrupt::typelevel::Interrupt; 
-
-        const INFO: Info = Info {
-            regs: crate::pac::CANFD0,
-            interrupt: crate::interrupt::typelevel::CANFD0::IRQ,
-            // mild voodoo - message RAM lives at the beginning of the address space of the MCAN peripheral, in a gap in the
-            // SVD between the base address and first documented register.
-            // Re-use the same register base address.
-            mem: unsafe { MessageRAMAccess::from_ptr( crate::pac::CANFD0.as_ptr() )}
-        };
-
-        &INFO
-    }
-
-    fn state() -> &'static State {
-        static STATE: State = State {
-            waker: AtomicWaker::new()
-        };
-
-        &STATE
-    }
-}
-
-impl Instance for crate::peripherals::CANFD0 {
-    type Interrupt = crate::interrupt::typelevel::CANFD0; // I'm still unclear why this type is needed _here_ too.
-}
 
 
 /// Functional clock divider - consider this as an additional few bits on top of the bitrate prescaler if needed.
@@ -582,12 +551,6 @@ impl<'d, M: Mode> Can<'d, M> {
 }
 
 
-
-
-// RX and TX pin traits - normally constructed via a macro, we'll do it manually to demonstrate functionality.
-// These are effectively sealed because pf_num isn't public so can't be implemented by anyone else.
-// we'll implement the correct combinations so the type system enforces you can't pass invalid pins in for each use case.
-// pf_num is metadata we need anyways.
 pub trait RxPin<T: Instance>: crate::gpio::Pin {
     fn pf_num(&self) -> u8;
 }
@@ -596,14 +559,56 @@ pub trait TxPin<T: Instance>: crate::gpio::Pin {
     fn pf_num(&self) -> u8;
 }
 
-impl RxPin<crate::peripherals::CANFD0> for crate::peripherals::PA27 {
-    fn pf_num(&self) -> u8 {
-        6u8
-    }
+macro_rules! impl_can_rx_pin {
+    ($instance: ident, $pin: ident, $pf: expr) => {
+        impl crate::can::RxPin<crate::peripherals::$instance> for crate::peripherals::$pin {
+            fn pf_num(&self) -> u8 {
+                $pf
+            }
+        }
+    };
+}
+macro_rules! impl_can_tx_pin {
+    ($instance: ident, $pin: ident, $pf: expr) => {
+        impl crate::can::TxPin<crate::peripherals::$instance> for crate::peripherals::$pin {
+            fn pf_num(&self) -> u8 {
+                $pf
+            }
+        }
+    };
 }
 
-impl TxPin<crate::peripherals::CANFD0> for crate::peripherals::PA26 {
-    fn pf_num(&self) -> u8 {
-        6u8
-    }
+macro_rules! impl_can_instance {
+    ($instance: ident) => {
+        impl crate::can::SealedInstance for crate::peripherals::$instance {
+            fn info() -> &'static crate::can::Info {
+                use crate::can::Info;
+                use crate::interrupt::typelevel::Interrupt; 
+
+                const INFO: Info = Info {
+                    regs: crate::pac::$instance,
+                    interrupt: crate::interrupt::typelevel::$instance::IRQ,
+                    // mild voodoo - message RAM lives at the beginning of the address space of the MCAN peripheral, in a gap in the
+                    // SVD between the base address and first documented register.
+                    // Re-use the same register base address.
+                    mem: unsafe { crate::can::msgram::MessageRAMAccess::from_ptr( crate::pac::$instance.as_ptr() )}
+                };
+
+                &INFO
+            }
+
+            fn state() -> &'static crate::can::State {
+                use crate::can::State;
+                static STATE: State = State {
+                    waker: embassy_sync::waitqueue::AtomicWaker::new()
+                };
+
+                &STATE
+            }
+            }
+
+        impl crate::can::Instance for crate::peripherals::$instance {
+            type Interrupt = crate::interrupt::typelevel::$instance; // I'm still unclear why this type is needed _here_ too.
+        }
+    };
 }

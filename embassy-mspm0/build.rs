@@ -641,6 +641,7 @@ fn generate_peripheral_instances() -> TokenStream {
             "uart" => Some(quote! { impl_uart_instance!(#peri); }),
             "i2c" => Some(quote! { impl_i2c_instance!(#peri, #fifo_size); }),
             "wwdt" => Some(quote! { impl_wwdt_instance!(#peri); }),
+            "canfd" => Some(quote! { impl_can_instance!(#peri); }),
             "adc" => Some(quote! { impl_adc_instance!(#peri); }),
             "mathacl" => Some(quote! { impl_mathacl_instance!(#peri); }),
             _ => None,
@@ -691,6 +692,8 @@ fn generate_pin_trait_impls() -> TokenStream {
                 ("uart", "RTS") => Some(quote! { impl_uart_rts_pin!(#peri, #pin_name, #pf); }),
                 ("i2c", "SDA") => Some(quote! { impl_i2c_sda_pin!(#peri, #pin_name, #pf); }),
                 ("i2c", "SCL") => Some(quote! { impl_i2c_scl_pin!(#peri, #pin_name, #pf); }),
+                ("canfd", "CANTX") => Some(quote! { impl_can_tx_pin!(#peri, #pin_name, #pf); }),
+                ("canfd", "CANRX") => Some(quote! { impl_can_rx_pin!(#peri, #pin_name, #pf); }),
                 ("adc", s) => {
                     let signal = s.parse::<u8>().unwrap();
                     Some(quote! { impl_adc_pin!(#peri, #pin_name, #signal); })
