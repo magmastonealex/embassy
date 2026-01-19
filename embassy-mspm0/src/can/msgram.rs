@@ -408,7 +408,7 @@ macro_rules! impl_ram_access {
 
 
     (@gen_getter $field:ident, $getter:ident, $el_type:ty) => {
-        pub fn $getter(&self, idx: usize) -> Option<$el_type> {
+        pub(super) fn $getter(&self, idx: usize) -> Option<$el_type> {
             unsafe {
                 // type check.
                 let _: *const [$el_type; _] = core::ptr::addr_of!((*self.ptr).$field);
@@ -436,7 +436,7 @@ macro_rules! impl_ram_access {
         // We'll be super careful inside of these unsafe blocks to do the right thing, but we will ignore ownership rules
         // just like the PAC does - it's up to the rest of the HAL to use this with great caution and expose a truly sound
         // API to consumers.
-        pub fn $setter(&self, idx: usize, val: $el_type) -> Option<()> {
+        pub(super) fn $setter(&self, idx: usize, val: $el_type) -> Option<()> {
             unsafe {
                 // type check.
                 let _: *const [$el_type; _] = core::ptr::addr_of!((*self.ptr).$field);
