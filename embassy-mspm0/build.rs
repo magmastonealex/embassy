@@ -21,6 +21,7 @@ fn main() {
 
     generate_code(&mut cfgs);
     select_gpio_features(&mut cfgs);
+    select_sysctl_features(&mut cfgs);
     interrupt_group_linker_magic();
 }
 
@@ -715,6 +716,25 @@ fn generate_pin_trait_impls() -> TokenStream {
 
     quote! {
         #(#impls)*
+    }
+}
+
+fn select_sysctl_features(cfgs: &mut CfgSet) {
+    // for now, it seems only mspm0g series (but all of them within the series?)
+    // have syspll.
+    cfgs.declare_all(&["sysctl_syspll"]);
+
+    let sysctl = METADATA
+        .peripherals
+        .iter()
+        .find(|p| p.name == "SYSCTL")
+        .expect("no SYSCTL peripheral");
+
+    match sysctl.version {
+        Some("g350x_g310x_g150x_g110x") | Some("g351x_g151x") => {
+            cfgs.enable("sysctl_syspll");
+        },
+        _ => {}
     }
 }
 

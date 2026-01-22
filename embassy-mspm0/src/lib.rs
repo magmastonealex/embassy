@@ -176,6 +176,95 @@ impl Default for Config {
     }
 }
 
+
+/// Read the PLL startup calibration values from the FACTORY region,
+/// given an expected f_loopin frequency.
+/// Returns SYSPLLPARAM0, SYSPLLPARAM1.
+#[cfg(sysctl_syspll)]
+fn load_pll_values(f_loopin: u32) -> Option<(u32, u32)> {
+    // TODO: should these be found via the PAC instead of hard-coded?
+    // From looking at the G series TRM, these addresses are constant,
+    // but it still feels wrong.
+    // Taken from table "Table 1-135. FACTORYREGION_TYPEG Registers"
+    // (constants identical to Table 1-116. FACTORYREGION_TYPEA Registers for PLL.)
+    let addrs: (u32, u32) = match f_loopin {
+        4_000_000..=8_000_000 => {
+            (0x41C4_001C, 0x41C4_0020)
+        },
+        8_000_001..=16_000_000 => {
+            (0x41C4_0024, 0x41C4_0028)
+        },
+        16_000_001..=32_000_000 => {
+            (0x41C4_002C, 0x41C4_0030)
+        },
+        32_000_001..48_000_000 => {
+            (0x41C4_0034, 0x41C4_0038)
+        },
+        _ => {
+            return None;
+        }
+    };
+
+    let param0 = unsafe { core::ptr::read_volatile(addrs.0 as *const u32)};
+    let param1 = unsafe { core::ptr::read_volatile(addrs.1 as *const u32)};
+
+    Some((param0, param1))
+
+}
+
+/// This is a minimal initialization for the PLL
+/// to run at 32MHz (matching MCLK), sources from SYSCLK
+/// This can then be used to feed the CANFD peripheral
+/// it's functional clock (fclk <= mclk).
+#[cfg(sysctl_syspll)]
+fn enable_pll() {
+    if !pac::SYSCTL.clkstatus().read().sysplloff() {
+        pac::SYSCTL.hsclken().modify(|w| {
+            w.set_syspllen(false);
+        });
+        // must wait for a "stable dead state" before re-enabling.
+        while !pac::SYSCTL.clkstatus().read().sysplloff() {
+            cortex_m::asm::delay(16);
+        }
+    }
+
+    // We will set the pre-divider to 2, and the VCO divider to 4, causing:
+    // Reference clk: 32MHz.
+    // Divided by pre-divider: 16MHz
+    // Multiplied by VCO divider: 64MHz
+    // Divided by clk1div: 32MHz
+    // Produces a CANFD functional clock of 32MHz (matching MCLK sourced from SYSOSC.)
+    //
+    // This is a very convoluted way to route the SYSOSC to the CANFD functional clock,
+    // but the only way supported with the clock tree we have.
+    // This is a stopgap to get CANFD working without too many external components.
+    
+    pac::SYSCTL.syspllcfg0().modify(|w| {
+        w.set_syspllref(pac::sysctl::vals::Syspllref::SYSOSC); // SYSOSC as PLL reference.
+        w.set_enableclk1(true); // SYSPLLCLK1 goes to CANFD as functional clock.
+        w.set_rdivclk1(pac::sysctl::vals::Rdivclk1::CLK1DIV2);
+
+    });
+    
+    pac::SYSCTL.syspllcfg1().modify(|w| {
+        w.set_pdiv(pac::sysctl::vals::Pdiv::REFDIV2); // Divide input clock by 2
+        w.set_qdiv(pac::sysctl::vals::Qdiv::from(3)); // Register value 3 results in /4 (causes VCO to be 3x reference clock = 64MHZ in this case)
+    });
+
+    let params = load_pll_values(16_000_000).unwrap();
+    pac::SYSCTL.syspllparam0().write_value(pac::sysctl::regs::Syspllparam0(params.0));
+    pac::SYSCTL.syspllparam1().write_value(pac::sysctl::regs::Syspllparam1(params.1));
+
+    pac::SYSCTL.hsclken().modify(|w| {
+        w.set_syspllen(true);
+    });
+
+    while !pac::SYSCTL.clkstatus().read().syspllgood() {
+        cortex_m::asm::delay(16);
+    }
+
+}
+
 pub fn init(config: Config) -> Peripherals {
     critical_section::with(|cs| {
         let peripherals = Peripherals::take_with_cs(cs);
@@ -199,6 +288,16 @@ pub fn init(config: Config) -> Peripherals {
         pac::SYSCTL.borthreshold().modify(|w| {
             w.set_level(0);
         });
+
+        // On parts which have both canfd and sysctl_syspll, enable syspll at 32MHz (match MCLK)
+        // This is a bit of a hack - canfd needs a functional clock from HFXT or SYSPLL,
+        // and syspll can be configured on every canfd-supported part.
+        // syspll is unlikely to be accurate enough for higher-bitrate CAN,
+        // and more complete clock tree support will eventually be required.
+        // We don't actually need to enable this unless there are any consumers,
+        // but we don't yet have the infrastructure to determine that or not.
+        #[cfg(sysctl_syspll)]
+        enable_pll();
 
         gpio::init(pac::GPIOA);
         #[cfg(gpio_pb)]

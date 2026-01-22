@@ -331,7 +331,7 @@ impl<'d, M: Mode> Can<'d, M> {
             w.set_clk_reqen(true);
         });
 
-        // Set a functional clock source - for now we only support HFCLK (HFXT or HFCLKIN).
+        // Set a functional clock source & divider - for now we only support SYSPLLOUT1.
         can.ti_wrapper(0).msp(0).subsys_clkdiv().write(|w| {
             w.set_ratio(match config.clock_div {
                 ClockDiv::DivBy1 => CanVals::Ratio::DIV_BY_1_,
@@ -341,7 +341,7 @@ impl<'d, M: Mode> Can<'d, M> {
         });
 
         pac::SYSCTL.genclkcfg().modify(|w| {
-            w.set_canclksrc(pac::sysctl::vals::Canclksrc::HFCLK);
+            w.set_canclksrc(pac::sysctl::vals::Canclksrc::SYSPLLOUT1);
         });
 
         // Wait for async reset to be complete.
