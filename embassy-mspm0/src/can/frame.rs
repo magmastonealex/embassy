@@ -1,13 +1,12 @@
 use embedded_can::{ExtendedId, Frame, Id, StandardId};
 
-use crate::can::msgram::{MsgHeader, RxBufferElement, TxBufferElement, TxHeader, MAX_DATA_LEN};
-
+use crate::can::msgram::{MAX_DATA_LEN, MsgHeader, RxBufferElement, TxBufferElement, TxHeader};
 
 pub struct MCanFrame {
     id: Id,
     dlc: usize,
     is_remote: bool,
-    data: [u8; MAX_DATA_LEN] // TODO: CAN-FD will require larger data. This also affects peripheral setup and msgram configuration.
+    data: [u8; MAX_DATA_LEN], // TODO: CAN-FD will require larger data. This also affects peripheral setup and msgram configuration.
 }
 
 #[cfg(feature = "defmt")]
@@ -15,15 +14,26 @@ impl defmt::Format for MCanFrame {
     fn format(&self, fmt: defmt::Formatter<'_>) {
         match self.id() {
             embedded_can::Id::Standard(id) => {
-                defmt::write!(fmt, "CAN frame: Standard ID={:x} len={}, data: {=[u8]:x}", id.as_raw(), self.dlc, &self.data[0..self.dlc])
+                defmt::write!(
+                    fmt,
+                    "CAN frame: Standard ID={:x} len={}, data: {=[u8]:x}",
+                    id.as_raw(),
+                    self.dlc,
+                    &self.data[0..self.dlc]
+                )
             }
             embedded_can::Id::Extended(id) => {
-                defmt::write!(fmt, "CAN frame: Extended ID={:x} len={}, data: {=[u8]:x}", id.as_raw(), self.dlc, &self.data[0..self.dlc])
+                defmt::write!(
+                    fmt,
+                    "CAN frame: Extended ID={:x} len={}, data: {=[u8]:x}",
+                    id.as_raw(),
+                    self.dlc,
+                    &self.data[0..self.dlc]
+                )
             }
         }
     }
 }
-
 
 impl Frame for MCanFrame {
     fn new(id: impl Into<embedded_can::Id>, data: &[u8]) -> Option<Self> {
@@ -35,9 +45,8 @@ impl Frame for MCanFrame {
             id: id.into(),
             dlc: data.len(),
             is_remote: false,
-            data: [0u8; MAX_DATA_LEN]
+            data: [0u8; MAX_DATA_LEN],
         };
-
 
         frame.data[..data.len()].clone_from_slice(data);
 
@@ -52,13 +61,13 @@ impl Frame for MCanFrame {
             id: id.into(),
             dlc: dlc,
             is_remote: true,
-            data: [0u8; MAX_DATA_LEN]
+            data: [0u8; MAX_DATA_LEN],
         })
     }
     fn is_extended(&self) -> bool {
         matches!(self.id(), Id::Extended(_))
     }
-    
+
     fn id(&self) -> embedded_can::Id {
         self.id
     }
@@ -66,7 +75,7 @@ impl Frame for MCanFrame {
     fn dlc(&self) -> usize {
         self.dlc
     }
-    
+
     fn data(&self) -> &[u8] {
         &self.data
     }
@@ -76,17 +85,16 @@ impl Frame for MCanFrame {
     }
 }
 
-
 impl From<RxBufferElement> for MCanFrame {
     fn from(value: RxBufferElement) -> Self {
         let id = if value.hdr.xtd() {
             // safety - we only read 29 bits of ID, there's no way this can be out of range.
-            Id::Extended(unsafe{ExtendedId::new_unchecked(value.hdr.id())})
+            Id::Extended(unsafe { ExtendedId::new_unchecked(value.hdr.id()) })
         } else {
             let id_shifted = (value.hdr.id() >> 18) as u16;
             // Safety - we only read 29 bits of ID, and we just shifted away 18 of them,
             // leaving only 11 possible non-zero bits.
-            Id::Standard(unsafe{StandardId::new_unchecked(id_shifted)})
+            Id::Standard(unsafe { StandardId::new_unchecked(id_shifted) })
         };
 
         // should always be true given how the peripheral is configured, but you never know.
@@ -96,7 +104,7 @@ impl From<RxBufferElement> for MCanFrame {
             id: id,
             dlc: value.rxhdr.dlc() as usize,
             is_remote: value.hdr.rtr(),
-            data: value.data
+            data: value.data,
         }
     }
 }
@@ -111,13 +119,13 @@ impl MCanFrame {
     /// be sent to the event FIFO.
     pub(in crate::can) fn to_tx_buffer(&self, marker: Option<u8>) -> TxBufferElement {
         let mut glblheader = MsgHeader(0);
-        
+
         glblheader.set_rtr(self.is_remote);
         match self.id {
             Id::Extended(extid) => {
                 glblheader.set_xtd(true);
                 glblheader.set_id(extid.as_raw());
-            },
+            }
             Id::Standard(stdid) => {
                 glblheader.set_xtd(false);
                 glblheader.set_id((stdid.as_raw() as u32) << 18);
@@ -135,7 +143,7 @@ impl MCanFrame {
         TxBufferElement {
             hdr: glblheader,
             txhdr,
-            data: self.data
+            data: self.data,
         }
     }
 }
@@ -144,7 +152,7 @@ impl MCanFrame {
 mod test {
     use super::*;
 
-#[test]
+    #[test]
     // Confirm that construction and conversion into a TxBufferElement works as expected for standard frames.
     fn convert_for_transmission_standard() {
         let id = StandardId::new(0x7FF).unwrap();
@@ -228,7 +236,7 @@ mod test {
         // Manually construct an RxBufferElement as the hardware would
         // For standard IDs, hardware puts them in bits [28:18]
         let mut hdr = MsgHeader(0);
-        hdr.set_id(0x7FF << 18); 
+        hdr.set_id(0x7FF << 18);
         hdr.set_xtd(false);
         hdr.set_rtr(false);
 
@@ -245,7 +253,7 @@ mod test {
         };
 
         let frame = MCanFrame::from(rx_element);
-        
+
         if let Id::Standard(sid) = frame.id() {
             assert_eq!(sid.as_raw(), 0x7FF);
         } else {
@@ -256,11 +264,11 @@ mod test {
         assert_eq!(frame.data()[..4], test_data[..4]);
     }
 
-        #[test]
+    #[test]
     fn test_rx_to_mcan_frame_extended_remote() {
         // Manually construct an RxBufferElement as the hardware would for extended frame with rtr bit set.
         let mut hdr = MsgHeader(0);
-        hdr.set_id(0x7FF); 
+        hdr.set_id(0x7FF);
         hdr.set_xtd(true);
         hdr.set_rtr(true);
 
@@ -275,7 +283,7 @@ mod test {
         };
 
         let frame = MCanFrame::from(rx_element);
-        
+
         if let Id::Extended(sid) = frame.id() {
             assert_eq!(sid.as_raw(), 0x7FF);
         } else {

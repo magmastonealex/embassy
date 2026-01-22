@@ -15,7 +15,7 @@ bitfield! {
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub(super) struct MsgHeader(u32); // note: Used for both RX and TX messages.
     u32;
-    
+
     /// Error State Indicator
     pub esi, set_esi: 31;
     /// Extended Identifier
@@ -32,7 +32,7 @@ bitfield! {
     pub(super) struct RxHeader(u32);
 
     /// Accepted Non-matching Frame
-    pub anmf, set_anmf: 31; 
+    pub anmf, set_anmf: 31;
 
     /// Filter index
     pub u8, fidx, set_fidx: 30, 24;
@@ -50,14 +50,13 @@ bitfield! {
     pub u16, rxts, set_rxts: 15, 0;
 }
 
-
 bitfield! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub struct TxHeader(u32);
 
     /// Message Marker
-    pub u8, mm, set_mm: 31, 24; 
+    pub u8, mm, set_mm: 31, 24;
 
     /// Event FIFO Control
     pub efc, set_efc: 23;
@@ -79,7 +78,7 @@ bitfield! {
 pub(super) enum EventType {
     Unknown = 0x00,
     TxEvent = 0x01,
-    TransmissionNotCancelled = 0x02
+    TransmissionNotCancelled = 0x02,
 }
 
 impl From<u8> for EventType {
@@ -87,7 +86,7 @@ impl From<u8> for EventType {
         match value {
             0x01 => Self::TxEvent,
             0x02 => Self::TransmissionNotCancelled,
-            _ => Self::Unknown
+            _ => Self::Unknown,
         }
     }
 }
@@ -98,7 +97,7 @@ bitfield! {
     pub(super) struct EventHeader(u32);
 
     /// Message Marker
-    pub u8, mm, _: 31, 24; 
+    pub u8, mm, _: 31, 24;
 
     /// Event Type
     pub u8, into EventType, et, _: 23, 22;
@@ -112,7 +111,6 @@ bitfield! {
     /// Data length code.
     pub u8, dlc, _: 19, 16;
 }
-
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -131,7 +129,7 @@ impl From<u8> for FilterType {
             0x01 => Self::DualIdFilter,
             0x02 => Self::ClassicFilter,
             0x03 => Self::Disable,
-            _ => Self::Unknown
+            _ => Self::Unknown,
         }
     }
 }
@@ -143,7 +141,7 @@ impl From<FilterType> for u8 {
             FilterType::DualIdFilter => 0x01,
             FilterType::ClassicFilter => 0x02,
             FilterType::Disable => 0x03,
-            FilterType::Unknown => 0x03 // disable filter if type is unknown.
+            FilterType::Unknown => 0x03, // disable filter if type is unknown.
         }
     }
 }
@@ -174,7 +172,7 @@ impl From<u8> for FilterConfiguration {
             0x05 => Self::SetPriorityAndStoreInFifo0,
             0x06 => Self::SetPriorityAndStoreInFifo1,
             0x07 => Self::StoreInRxBuffer,
-            _ => Self::Unknown
+            _ => Self::Unknown,
         }
     }
 }
@@ -190,7 +188,7 @@ impl From<FilterConfiguration> for u8 {
             FilterConfiguration::SetPriorityAndStoreInFifo0 => 0x05,
             FilterConfiguration::SetPriorityAndStoreInFifo1 => 0x06,
             FilterConfiguration::StoreInRxBuffer => 0x07,
-            FilterConfiguration::Unknown => 0x00 // will be truncated into disable for storage.
+            FilterConfiguration::Unknown => 0x00, // will be truncated into disable for storage.
         }
     }
 }
@@ -223,7 +221,7 @@ impl Default for StandardFilter {
 bitfield! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    pub(super) struct ExtendedFilter1(u32); 
+    pub(super) struct ExtendedFilter1(u32);
     /// Filter configuration
     pub u8, from into FilterConfiguration, efec, set_efec: 31, 29;
     /// Filter ID 1.
@@ -233,7 +231,7 @@ bitfield! {
 bitfield! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    pub(super) struct ExtendedFilter2(u32); 
+    pub(super) struct ExtendedFilter2(u32);
 
     /// Filter type
     pub u8, from into FilterType, eft, set_eft: 31, 30;
@@ -253,10 +251,13 @@ pub(super) struct ExtendedFilter {
 
 impl Default for ExtendedFilter {
     fn default() -> Self {
-        let mut s = ExtendedFilter { ef1: ExtendedFilter1(0), ef2: ExtendedFilter2(0) };
+        let mut s = ExtendedFilter {
+            ef1: ExtendedFilter1(0),
+            ef2: ExtendedFilter2(0),
+        };
         s.ef2.set_eft(FilterType::Disable);
         s.ef1.set_efec(FilterConfiguration::Disable);
-        
+
         s
     }
 }
@@ -268,7 +269,7 @@ pub(super) struct RxBufferElement {
     // a bit awkward to split this into two structs, but this is hidden from downstream consumers anyways.
     pub hdr: MsgHeader,
     pub rxhdr: RxHeader,
-    pub data: [u8; MAX_DATA_LEN]
+    pub data: [u8; MAX_DATA_LEN],
 }
 
 impl Default for RxBufferElement {
@@ -276,7 +277,7 @@ impl Default for RxBufferElement {
         Self {
             hdr: MsgHeader(0),
             rxhdr: RxHeader(0),
-            data: [0u8; MAX_DATA_LEN]
+            data: [0u8; MAX_DATA_LEN],
         }
     }
 }
@@ -288,7 +289,7 @@ pub(super) struct TxBufferElement {
     // a bit awkward to split this into two structs, but this is hidden from downstream consumers anyways.
     pub hdr: MsgHeader,
     pub txhdr: TxHeader,
-    pub data: [u8; MAX_DATA_LEN]
+    pub data: [u8; MAX_DATA_LEN],
 }
 
 impl Default for TxBufferElement {
@@ -296,7 +297,7 @@ impl Default for TxBufferElement {
         Self {
             hdr: MsgHeader(0),
             txhdr: TxHeader(0),
-            data: [0u8; MAX_DATA_LEN]
+            data: [0u8; MAX_DATA_LEN],
         }
     }
 }
@@ -307,18 +308,17 @@ impl Default for TxBufferElement {
 pub(super) struct TxEventElement {
     // a bit awkward to split this into two structs, but this is hidden from downstream consumers anyways.
     pub hdr: MsgHeader,
-    pub event: EventHeader
+    pub event: EventHeader,
 }
 
 impl Default for TxEventElement {
     fn default() -> Self {
         Self {
             hdr: MsgHeader(0),
-            event: EventHeader(0)
+            event: EventHeader(0),
         }
     }
 }
-
 
 /// Structure to represent the data within Message RAM of the CANFD / MCAN peripheral.
 /// Note that on TI parts, this data lives at the base address of the CANFD/MCAN peripheral (this is not yet documented by TI, though.)
@@ -326,13 +326,12 @@ impl Default for TxEventElement {
 pub(super) struct McanMessageRAM {
     filters: [StandardFilter; 0],
     extended_filters: [ExtendedFilter; 0],
-    rxfifo0: [RxBufferElement; NUM_RX_ELEMENTS], 
+    rxfifo0: [RxBufferElement; NUM_RX_ELEMENTS],
     rxfifo1: [RxBufferElement; 0], // Note: while we're not using most of these features yet, I've included their offsets and structures anyways to save the next person some pain.
     rxbuffers: [RxBufferElement; 0],
     txevents: [TxEventElement; NUM_TX_EVENTS],
     txfifo0: [TxBufferElement; NUM_TX_ELEMENTS],
 }
-
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(super) struct MessageRamOffsetsSizes {
@@ -349,15 +348,26 @@ impl McanMessageRAM {
     /// Determine the sizes of the various arrays at compile time,
     /// will be used to configure the peripheral.
     pub const SIZES: MessageRamOffsetsSizes = {
-
         // trying to do this without needing to instantiate anything.
-        let num_filters = core::mem::offset_of!(McanMessageRAM, extended_filters) / core::mem::size_of::<StandardFilter>();
-        let num_extended = (core::mem::offset_of!(McanMessageRAM, rxfifo0) - core::mem::offset_of!(McanMessageRAM, extended_filters))/core::mem::size_of::<ExtendedFilter>();
-        let num_rxfifo0 = (core::mem::offset_of!(McanMessageRAM, rxfifo1) - core::mem::offset_of!(McanMessageRAM, rxfifo0))/core::mem::size_of::<RxBufferElement>();
-        let num_rxfifo1 = (core::mem::offset_of!(McanMessageRAM, rxbuffers) - core::mem::offset_of!(McanMessageRAM, rxfifo1))/core::mem::size_of::<RxBufferElement>();
-        let num_rxbuffers = (core::mem::offset_of!(McanMessageRAM, txevents) - core::mem::offset_of!(McanMessageRAM, rxbuffers))/core::mem::size_of::<RxBufferElement>();
-        let num_txevents = (core::mem::offset_of!(McanMessageRAM, txfifo0) - core::mem::offset_of!(McanMessageRAM, txevents))/core::mem::size_of::<TxEventElement>();
-        let num_txfifo = (core::mem::size_of::<McanMessageRAM>() - core::mem::offset_of!(McanMessageRAM, txfifo0))/core::mem::size_of::<TxBufferElement>();
+        let num_filters =
+            core::mem::offset_of!(McanMessageRAM, extended_filters) / core::mem::size_of::<StandardFilter>();
+        let num_extended = (core::mem::offset_of!(McanMessageRAM, rxfifo0)
+            - core::mem::offset_of!(McanMessageRAM, extended_filters))
+            / core::mem::size_of::<ExtendedFilter>();
+        let num_rxfifo0 = (core::mem::offset_of!(McanMessageRAM, rxfifo1)
+            - core::mem::offset_of!(McanMessageRAM, rxfifo0))
+            / core::mem::size_of::<RxBufferElement>();
+        let num_rxfifo1 = (core::mem::offset_of!(McanMessageRAM, rxbuffers)
+            - core::mem::offset_of!(McanMessageRAM, rxfifo1))
+            / core::mem::size_of::<RxBufferElement>();
+        let num_rxbuffers = (core::mem::offset_of!(McanMessageRAM, txevents)
+            - core::mem::offset_of!(McanMessageRAM, rxbuffers))
+            / core::mem::size_of::<RxBufferElement>();
+        let num_txevents = (core::mem::offset_of!(McanMessageRAM, txfifo0)
+            - core::mem::offset_of!(McanMessageRAM, txevents))
+            / core::mem::size_of::<TxEventElement>();
+        let num_txfifo = (core::mem::size_of::<McanMessageRAM>() - core::mem::offset_of!(McanMessageRAM, txfifo0))
+            / core::mem::size_of::<TxBufferElement>();
 
         if core::mem::size_of::<McanMessageRAM>() > 1024 {
             core::panic!("message RAM too large!");
@@ -370,7 +380,7 @@ impl McanMessageRAM {
             rxfifo1: num_rxfifo1,
             rxbuffers: num_rxbuffers,
             txevents: num_txevents,
-            txfifo: num_txfifo
+            txfifo: num_txfifo,
         }
     };
 
@@ -379,12 +389,12 @@ impl McanMessageRAM {
     pub const OFFSETS: MessageRamOffsetsSizes = {
         MessageRamOffsetsSizes {
             filters: 0,
-            extended_filters: core::mem::offset_of!(McanMessageRAM, extended_filters)/4,
-            rxfifo0: core::mem::offset_of!(McanMessageRAM, rxfifo0)/4,
-            rxfifo1: core::mem::offset_of!(McanMessageRAM, rxfifo1)/4,
-            rxbuffers: core::mem::offset_of!(McanMessageRAM, rxbuffers)/4,
-            txevents: core::mem::offset_of!(McanMessageRAM, txevents)/4,
-            txfifo: core::mem::offset_of!(McanMessageRAM, txfifo0)/4
+            extended_filters: core::mem::offset_of!(McanMessageRAM, extended_filters) / 4,
+            rxfifo0: core::mem::offset_of!(McanMessageRAM, rxfifo0) / 4,
+            rxfifo1: core::mem::offset_of!(McanMessageRAM, rxfifo1) / 4,
+            rxbuffers: core::mem::offset_of!(McanMessageRAM, rxbuffers) / 4,
+            txevents: core::mem::offset_of!(McanMessageRAM, txevents) / 4,
+            txfifo: core::mem::offset_of!(McanMessageRAM, txfifo0) / 4,
         }
     };
 }
@@ -425,7 +435,7 @@ macro_rules! impl_ram_access {
 
     (@gen_setter $field:ident, $setter:ident, $el_type:ty) => {
         // Note that this setter takes a non-mutable reference yet does mutate data.
-        // The PACs do the same thing - a writable Reg has a function: 
+        // The PACs do the same thing - a writable Reg has a function:
         // `pub fn write_value(&self, val: T)`
         // which effectively ignores ownership rules.
         //
@@ -455,7 +465,7 @@ macro_rules! impl_ram_access {
 
 /// register/pac-like access to MessageRAM at a specific address.
 pub(crate) struct MessageRAMAccess {
-    ptr: *mut McanMessageRAM
+    ptr: *mut McanMessageRAM,
 }
 impl MessageRAMAccess {
     #[inline(always)]
@@ -490,14 +500,18 @@ mod tests {
         msgram.rxfifo0[0].rxhdr.set_dlc(4);
 
         let element_bkup = msgram.rxfifo0[0].clone();
-        
+
         let ramacess: MessageRAMAccess = MessageRAMAccess { ptr: &mut msgram };
 
         assert!(ramacess.get_rx_fifo_element(NUM_RX_ELEMENTS).is_none());
         let element = ramacess.get_rx_fifo_element(0).unwrap();
         assert_eq!(element_bkup, element);
 
-        assert!(ramacess.set_tx_element(NUM_TX_ELEMENTS+1, TxBufferElement::default()).is_none());
+        assert!(
+            ramacess
+                .set_tx_element(NUM_TX_ELEMENTS + 1, TxBufferElement::default())
+                .is_none()
+        );
         let mut txelement = TxBufferElement::default();
         txelement.data[0] = 0x55;
         txelement.data[1] = 0xAA;
@@ -509,6 +523,6 @@ mod tests {
 
         assert_eq!(msgram.txfifo0[0], txelement_bak);
 
-        // I'm only going to test 
+        // I'm only going to test
     }
 }

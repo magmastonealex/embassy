@@ -6,59 +6,29 @@ use embassy_hal_internal::PeripheralType;
 
 use crate::Peri;
 use crate::can::frame::MCanFrame;
-use crate::can::msgram::{MessageRAMAccess, McanMessageRAM};
+use crate::can::msgram::{McanMessageRAM, MessageRAMAccess};
 use crate::gpio::{AnyPin, PfType};
-use crate::interrupt::Interrupt;
 use crate::mode::{Blocking, Mode};
 use crate::pac::canfd::{Canfd as Regs, vals as CanVals};
 use crate::pac::{self};
-
-use embassy_sync::waitqueue::AtomicWaker;
 
 pub(crate) mod msgram;
 
 pub mod frame;
 
-// Major TODOs still:
-// 1. Concurrency here _feels_ sketchy and needs a good review. Remember the PAC and msgram purposefully disable borrow checker protections against simultaneous access.
-// X. Rip out marker # and TX event details for now - not needed right now.
-// 3. Actually implement the trait instead of using the half-implementations we have now :)
-//    -> Note the trait actually has no provision for confirming frames were actually sent, so the TX event FIFO is not required.
-//    -> The trait also does not implement true async! We may want to provide those anyways?
-//    -> Move the Blocking methods to the parent. Implement the two traits for the Blocking type. Figure out how to retry.
-// 4. do _something_ to handle bus-off and other protocol errors. It's not clear to me yet what the right interface is for that. Probably involves a config to decide how to handle bus-off / error-passive?
-//    -> Config has been added, and functions for manually polling and recoverying have been added.
-//    -> can simulate by setting invalid bitrate, maybe?
-// 5. Write a little test jig to ping things back and forth in various situations to prove things are working
-// X. Add tests to msgram and frame to confirm correct construction (done?)
-// 5. Docs!
-// 6. Bit rate calculations & accompanying tests.
-//    -> Defer to later.
-// X. Pin / peripheral macros.
-//
-// 8. As discussed in matrix - configuration for syspll to start it from RC oscillator at 32MHz for now to avoid needing to do _too_ much extra clocking.
-
-pub(crate) struct Info { // metadata/details about the specific instance of the peripheral in use.
+pub(crate) struct Info {
+    // metadata/details about the specific instance of the peripheral in use.
     pub(crate) regs: Regs, // the registers for this specific instance
-    pub(crate) interrupt: Interrupt, // which interrupt applies to this peripheral
-    pub(crate) mem: MessageRAMAccess
-}
-
-pub(crate) struct State {
-    // waker for when interesting things happen, I guess.
-    pub(crate) waker: AtomicWaker,
+    pub(crate) mem: MessageRAMAccess,
 }
 
 // prevent external callers from creating instances of this.
 pub(crate) trait SealedInstance {
     fn info() -> &'static Info;
-    fn state() -> &'static State;
 }
 
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + PeripheralType {
-    type Interrupt: crate::interrupt::typelevel::Interrupt;
-}
+pub trait Instance: SealedInstance + PeripheralType {}
 
 /// Functional clock divider - consider this as an additional few bits on top of the bitrate prescaler if needed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -79,49 +49,38 @@ pub enum ClockDiv {
 /// This crate handles this for you, so the values in this struct should be the actual values you wish to use.
 /// Strongly suggest using the from_bitrate function to determine values here.
 pub struct CanTimings {
-    pub brp: u16, /// Bitrate prescaler, valid values 1-512. 
-    pub sjw: u8, /// Sync Jump Width - valid values 1-128, though must also be <= ntseg2.
+    pub brp: u16,
+    /// Bitrate prescaler, valid values 1-512.
+    pub sjw: u8,
+    /// Sync Jump Width - valid values 1-128, though must also be <= ntseg2.
     pub ntseg1: u16, // Segment 1 time. Valid values are 2-256
     pub ntseg2: u8, // Segment 2 time. Valid values are 2-128.
 }
 
 impl CanTimings {
     pub const fn from_values(brp: u16, sjw: u8, ntseg1: u16, ntseg2: u8) -> Option<CanTimings> {
-        Some(CanTimings { brp, sjw, ntseg1, ntseg2 })
+        Some(CanTimings {
+            brp,
+            sjw,
+            ntseg1,
+            ntseg2,
+        })
     }
-}
-
-/// Error handling behaviour - 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum BusOffHandling {
-    /// Auto Re-Init - when a bus-off condition is encountered, the peripheral will be restarted immediately.
-    AutoReInit,
-
-    // Manual Re-Init - The peripheral will be left in the bus-off state indefinitely.
-    // It is up to the consumer to regularly poll for status and call recover().
-    ManualReInit
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 /// CAN Configuration
 pub struct Config {
-    /// Input clock rate
-    /// (Temporary - currently this crate doesn't support more complex clock configurations - CAN clock will always be sourced from HFXT/HFEXT_IN, and we require the clock rate here)
-    pub functional_clock_rate: u32,
-
     /// Input clock divider
     pub clock_div: ClockDiv,
-
-    pub bus_off_handling: BusOffHandling,
 
     /// CAN timings to use for standard CAN. (CAN-FD support to come later.)
     pub timing: CanTimings,
 
     pub accept_remote_frames: bool,
 
-    pub accept_extended_ids: bool
+    pub accept_extended_ids: bool,
 }
 
 #[non_exhaustive]
@@ -140,7 +99,6 @@ pub enum InitializationError {
     /// and the device will need to be reset before it will function again.
     PeripheralTimedOut,
 }
-
 
 #[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -170,6 +128,23 @@ pub enum BusError {
     BitDominant,
     ///The CRC check sum of a received message was incorrect. The CRC of an incoming message does not match with the CRC calculated from the received data.
     Crc,
+
+    /// A non-blocking method was called and the request would require blocking to complete.
+    WouldBlock,
+}
+
+impl embedded_can::Error for BusError {
+    fn kind(&self) -> embedded_can::ErrorKind {
+        match self {
+            Self::Stuff => embedded_can::ErrorKind::Stuff,
+            Self::Form => embedded_can::ErrorKind::Form,
+            Self::Acknowledge => embedded_can::ErrorKind::Acknowledge,
+            Self::BitRecessive => embedded_can::ErrorKind::Bit,
+            Self::BitDominant => embedded_can::ErrorKind::Bit,
+            Self::Crc => embedded_can::ErrorKind::Crc,
+            _ => embedded_can::ErrorKind::Other,
+        }
+    }
 }
 
 #[non_exhaustive]
@@ -177,16 +152,12 @@ pub enum BusError {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 /// Error status of the CAN peripheral
 pub enum RecoveryFailure {
-    /// The peripheral doesn't need to be recovered manually.
-    WasAutomatic,
     /// The peripheral was not in bus-off state.
     WasNotBusOff,
 }
 
 pub struct Can<'d, M: Mode> {
     info: &'static Info,
-    state: &'static State,
-    config: Config,
     _rx: Option<Peri<'d, AnyPin>>,
     _tx: Option<Peri<'d, AnyPin>>,
     _phantom: PhantomData<M>,
@@ -196,11 +167,11 @@ impl<'d> Can<'d, Blocking> {
     /// The "Blocking" CAN instance actually implements both the blocking and non-blocking embedded-can traits.
     /// the nb traits either work or do not and aren't actually async.
     /// The Async version of this driver will offer options to properly handle asynchronous work.
-    pub fn new_blocking<T: Instance> (
+    pub fn new_blocking<T: Instance>(
         peri: Peri<'d, T>,
         rx: Peri<'d, impl RxPin<T>>,
         tx: Peri<'d, impl TxPin<T>>,
-        config: Config
+        config: Config,
     ) -> Result<Self, InitializationError> {
         Self::new_inner(peri, rx, tx, config)
     }
@@ -212,7 +183,11 @@ impl<'d> Can<'d, Blocking> {
         }
         let read_index = cur_status.f0gi();
 
-        let element = self.info.mem.get_rx_fifo_element(read_index as usize).expect("invalid read index - bad peripheral config?");
+        let element = self
+            .info
+            .mem
+            .get_rx_fifo_element(read_index as usize)
+            .expect("invalid read index - bad peripheral config?");
 
         // mark the element as acknowledged.
         self.info.regs.mcan(0).rxf0a().write(|w| {
@@ -222,7 +197,6 @@ impl<'d> Can<'d, Blocking> {
         Some(element.into())
     }
 
-
     /// Retrieve a frame from the peripheral in a blocking fashion.
     /// Will return a BusError if the peripheral enters bus-off state.
     pub fn get_frame_blocking(&mut self) -> Result<MCanFrame, BusError> {
@@ -230,10 +204,10 @@ impl<'d> Can<'d, Blocking> {
             if let Some(frame) = self.get_frame() {
                 return Ok(frame);
             }
-            
+
             // BusOff will never recover by itself - bail so the caller can deal with this.
             match self.status() {
-                Some(BusError::BusOff) => {return Err(BusError::BusOff)},
+                Some(BusError::BusOff) => return Err(BusError::BusOff),
                 _ => {}
             }
 
@@ -249,10 +223,12 @@ impl<'d> Can<'d, Blocking> {
             return None;
         }
 
-
         let txbuf = frame.to_tx_buffer(None); // note we do not support TX events yet.
         let write_index = cur_status.tfqp();
-        self.info.mem.set_tx_element(write_index as usize, txbuf).expect("invalid write index - bad periph config?");
+        self.info
+            .mem
+            .set_tx_element(write_index as usize, txbuf)
+            .expect("invalid write index - bad periph config?");
 
         // tell the peripheral we've written a new entry into the TX FIFO.
         self.info.regs.mcan(0).txbar().write(|w| {
@@ -266,11 +242,11 @@ impl<'d> Can<'d, Blocking> {
         loop {
             if let Some(_) = self.enqueue_frame(frame) {
                 return Ok(());
-           }
+            }
 
             // BusOff will never recover by itself - bail so the caller can deal with this.
             match self.status() {
-                Some(BusError::BusOff) => {return Err(BusError::BusOff)},
+                Some(BusError::BusOff) => return Err(BusError::BusOff),
                 _ => {}
             }
 
@@ -279,15 +255,57 @@ impl<'d> Can<'d, Blocking> {
     }
 }
 
+// Implementations for the embedded_can traits.
+// I am really not sure that these are good abstractions for real applications.
+// They do not support "confirmable" mesage sending (i.e the docs specifically state that
+// transmit() only enqueues frames, there is no feedback mechanisim to confirm if/when a frame
+// was actually sent)
+// They also do not support monitoring the peripheral's status or recovering from bus-off.
+// I will implement them regardless to play nice with the overall ecosystem,
+// but similar to embassy-stm32, I'm going to offer a HAL-specific API which provides
+// more useful functionality, and add an async variant at some point.
+
+impl<'d> embedded_can::blocking::Can for Can<'d, Blocking> {
+    type Error = BusError;
+    type Frame = MCanFrame;
+    fn receive(&mut self) -> Result<Self::Frame, Self::Error> {
+        self.get_frame_blocking()
+    }
+    fn transmit(&mut self, frame: &Self::Frame) -> Result<(), Self::Error> {
+        self.enqueue_frame_blocking(frame)
+    }
+}
+
+impl<'d> embedded_can::nb::Can for Can<'d, Blocking> {
+    type Error = BusError;
+    type Frame = MCanFrame;
+    fn receive(&mut self) -> embedded_hal_nb::nb::Result<Self::Frame, Self::Error> {
+        match self.get_frame() {
+            Some(frame) => Ok(frame),
+            None => Err(embedded_hal_nb::nb::Error::WouldBlock),
+        }
+    }
+
+    fn transmit(&mut self, frame: &Self::Frame) -> embedded_hal_nb::nb::Result<Option<Self::Frame>, Self::Error> {
+        if let None = self.enqueue_frame(frame) {
+            // TODO: The trait suggests re-ordering the TX queue at this point to replace a lower-priority frame.
+            // I am not convinced that is a sound operation in this case as we don't know which frame MCAN is currently
+            // transmitting.
+            return Err(embedded_hal_nb::nb::Error::WouldBlock);
+        }
+
+        return Ok(None);
+    }
+}
+
 impl<'d, M: Mode> Can<'d, M> {
     fn reset_poweron<T: Instance>(_peri: &Peri<'d, T>, config: &Config) -> Result<(), InitializationError> {
         // See e2e: https://e2e.ti.com/support/microcontrollers/arm-based-microcontrollers-group/arm-based-microcontrollers/f/arm-based-microcontrollers-forum/1605241/mspm0g3107-mcan-peripheral-does-not-complete-initialization-after-power-on-reset
-        // The initialization instructions in the TRM are not accurate at this time, which I had to figure out the hard way.
+        // The initialization instructions in the TRM are not accurate at this time.
         // Suggested "restart" / reset approach is to do a reset, then disable power, then re-enable power.
         // If you do not wait >= 50us before accessing peripheral registers for the first time (or trying to enable clock) after enabling power,
         // the peripheral will lock up and only ever return zeros until reset via sysrst.
         let can = T::info().regs;
-        
 
         can.rstctl().write(|w| {
             w.set_resetstkyclr(true);
@@ -318,7 +336,7 @@ impl<'d, M: Mode> Can<'d, M> {
             w.set_ratio(match config.clock_div {
                 ClockDiv::DivBy1 => CanVals::Ratio::DIV_BY_1_,
                 ClockDiv::DivBy2 => CanVals::Ratio::DIV_BY_2_,
-                ClockDiv::DivBy4 => CanVals::Ratio::DIV_BY_4_
+                ClockDiv::DivBy4 => CanVals::Ratio::DIV_BY_4_,
             });
         });
 
@@ -328,7 +346,14 @@ impl<'d, M: Mode> Can<'d, M> {
 
         // Wait for async reset to be complete.
         let mut iter = 0;
-        while can.ti_wrapper(0).processors(0).subsys_regs(0).subsys_stat().read().reset() {
+        while can
+            .ti_wrapper(0)
+            .processors(0)
+            .subsys_regs(0)
+            .subsys_stat()
+            .read()
+            .reset()
+        {
             if iter > 1000 {
                 return Err(InitializationError::PeripheralTimedOut);
             }
@@ -338,7 +363,14 @@ impl<'d, M: Mode> Can<'d, M> {
 
         // Wait for "memory initialization" to be complete. I think this is zeroing the internal message RAM.
         iter = 0;
-        while can.ti_wrapper(0).processors(0).subsys_regs(0).subsys_stat().read().mem_init_done() {
+        while can
+            .ti_wrapper(0)
+            .processors(0)
+            .subsys_regs(0)
+            .subsys_stat()
+            .read()
+            .mem_init_done()
+        {
             if iter > 1000 {
                 return Err(InitializationError::PeripheralTimedOut);
             }
@@ -351,7 +383,15 @@ impl<'d, M: Mode> Can<'d, M> {
         if crel.0 == 0x00 {
             return Err(InitializationError::PeripheralTimedOut);
         }
-        debug!("MCAN version: {}.{}.{} - {}{}{}", crel.rel(), crel.step(), crel.substep(), crel.year(), crel.mon(), crel.day());
+        debug!(
+            "MCAN version: {}.{}.{} - {}{}{}",
+            crel.rel(),
+            crel.step(),
+            crel.substep(),
+            crel.year(),
+            crel.mon(),
+            crel.day()
+        );
 
         Ok(())
     }
@@ -361,7 +401,10 @@ impl<'d, M: Mode> Can<'d, M> {
     /// and won't send or receive frames, acks, or errors.
     /// If the closure returns with an error, the peripheral will _not_ be placed back into "Normal" mode
     /// as it may be in an inconsistent state.
-    fn guarded_config<T: Instance> (_peri: &Peri<'d, T>, f: impl FnOnce(&Regs) -> Result<(), InitializationError> ) -> Result<(), InitializationError> {
+    fn guarded_config<T: Instance>(
+        _peri: &Peri<'d, T>,
+        f: impl FnOnce(&Regs) -> Result<(), InitializationError>,
+    ) -> Result<(), InitializationError> {
         let can = T::info().regs;
 
         // Put the peripheral into "initialization" mode as a first step to allow register changes.
@@ -408,20 +451,19 @@ impl<'d, M: Mode> Can<'d, M> {
         }
     }
 
-    fn new_inner<T: Instance> (
+    fn new_inner<T: Instance>(
         peri: Peri<'d, T>,
         rx: Peri<'d, impl RxPin<T>>,
         tx: Peri<'d, impl TxPin<T>>,
-        config: Config
+        config: Config,
     ) -> Result<Self, InitializationError> {
-
         // Note: use new_pin! when in tree.
         let rx_inner = new_pin!(rx, PfType::input(crate::gpio::Pull::None, false));
         let tx_inner = new_pin!(tx, PfType::output(crate::gpio::Pull::None, false));
 
         // Reset and power on the CAN peripheral. Note this _is_ a falliable operation.
         Self::reset_poweron(&peri, &config)?;
-    
+
         Self::guarded_config(&peri, |can| -> Result<(), InitializationError> {
             can.mcan(0).cccr().modify(|w| {
                 w.set_fdoe(false); // classic CAN, no FD.
@@ -432,7 +474,7 @@ impl<'d, M: Mode> Can<'d, M> {
                 // Docs state that the hardware will actually use 1 greater than the value set in the register, so subtract one here.
                 w.set_nbrp(config.timing.brp - 1);
 
-                w.set_ntseg1(config.timing.ntseg1 as u8 - 1); 
+                w.set_ntseg1(config.timing.ntseg1 as u8 - 1);
                 w.set_ntseg2(config.timing.ntseg2 - 1);
 
                 w.set_nsjw(config.timing.sjw - 1);
@@ -448,7 +490,7 @@ impl<'d, M: Mode> Can<'d, M> {
                 } else {
                     w.set_anfe(0b10); // Reject extended frames.
                 }
-                w.set_rrfs(!config.accept_remote_frames ); // Reject remote frames with 11-bit IDs?
+                w.set_rrfs(!config.accept_remote_frames); // Reject remote frames with 11-bit IDs?
                 w.set_rrfe(!(config.accept_remote_frames && config.accept_extended_ids)); // reject remote frames with extended IDs?
             });
 
@@ -515,11 +557,9 @@ impl<'d, M: Mode> Can<'d, M> {
 
         Ok(Can {
             info: T::info(),
-            state: T::state(),
-            config,
             _rx: rx_inner,
             _tx: tx_inner,
-            _phantom: PhantomData
+            _phantom: PhantomData,
         })
     }
 
@@ -549,16 +589,12 @@ impl<'d, M: Mode> Can<'d, M> {
         } else if status.ew() {
             return Some(BusError::ErrorWarning);
         } else {
-            return Can::<M>::reg_to_error(status.lec())
+            return Can::<M>::reg_to_error(status.lec());
         }
     }
 
     /// Attempt to recover from a bus-off condition.
     pub fn recover(&mut self) -> Result<(), RecoveryFailure> {
-        // Confirm we are in manual recovery mode (otherwise, ISR will handle this.)
-        if self.config.bus_off_handling != BusOffHandling::ManualReInit {
-            return Err(RecoveryFailure::WasAutomatic);
-        }
         let mcan = self.info.regs.mcan(0);
         // Confirm we're in bus-off state.
         if !mcan.psr().read().bo() {
@@ -572,7 +608,6 @@ impl<'d, M: Mode> Can<'d, M> {
         Ok(())
     }
 }
-
 
 pub trait RxPin<T: Instance>: crate::gpio::Pin {
     fn pf_num(&self) -> u8;
@@ -606,32 +641,21 @@ macro_rules! impl_can_instance {
         impl crate::can::SealedInstance for crate::peripherals::$instance {
             fn info() -> &'static crate::can::Info {
                 use crate::can::Info;
-                use crate::interrupt::typelevel::Interrupt; 
 
                 const INFO: Info = Info {
                     regs: crate::pac::$instance,
-                    interrupt: crate::interrupt::typelevel::$instance::IRQ,
                     // mild voodoo - message RAM lives at the beginning of the address space of the MCAN peripheral, in a gap in the
                     // SVD between the base address and first documented register.
                     // Re-use the same register base address.
-                    mem: unsafe { crate::can::msgram::MessageRAMAccess::from_ptr( crate::pac::$instance.as_ptr() )}
+                    mem: unsafe { crate::can::msgram::MessageRAMAccess::from_ptr(crate::pac::$instance.as_ptr()) },
                 };
 
                 &INFO
             }
-
-            fn state() -> &'static crate::can::State {
-                use crate::can::State;
-                static STATE: State = State {
-                    waker: embassy_sync::waitqueue::AtomicWaker::new()
-                };
-
-                &STATE
-            }
-            }
+        }
 
         impl crate::can::Instance for crate::peripherals::$instance {
-            type Interrupt = crate::interrupt::typelevel::$instance; // I'm still unclear why this type is needed _here_ too.
+            // TODO: This will be expanded when async support is added to include the specific interrupt used for this peripheral.
         }
     };
 }
