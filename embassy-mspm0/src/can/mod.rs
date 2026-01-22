@@ -580,6 +580,9 @@ impl<'d, M: Mode> Can<'d, M> {
         }
     }
 
+    /// Determine the current error status of the peripheral.
+    /// If any errors have been detected, they will be returned.
+    /// If peripheral is operating normally, then None will be returned.
     pub fn status(&self) -> Option<BusError> {
         let status = self.info.regs.mcan(0).psr().read();
         if status.bo() {
@@ -594,6 +597,7 @@ impl<'d, M: Mode> Can<'d, M> {
     }
 
     /// Attempt to recover from a bus-off condition.
+    /// Will return immediately, and status can be monitored through calls to status()
     pub fn recover(&mut self) -> Result<(), RecoveryFailure> {
         let mcan = self.info.regs.mcan(0);
         // Confirm we're in bus-off state.

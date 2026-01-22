@@ -31,7 +31,7 @@ fn generate_code(cfgs: &mut CfgSet) {
         PathBuf::from(env::var_os("OUT_DIR").unwrap()).display(),
     );
 
-    cfgs.declare_all(&["gpio_pb", "gpio_pc", "int_group1", "unicomm"]);
+    cfgs.declare_all(&["gpio_pb", "gpio_pc", "int_group1", "unicomm", "canfd"]);
 
     let chip_name = match env::vars()
         .map(|(a, _)| a)
@@ -314,6 +314,11 @@ fn get_singletons(cfgs: &mut common::CfgSet) -> Vec<Singleton> {
 
             // TODO: Remove after TIMB is fixed
             "tim" if peripheral.name.starts_with("TIMB") => true,
+
+            "canfd" => {
+                cfgs.enable("canfd");
+                false
+            }
 
             _ => false,
         };

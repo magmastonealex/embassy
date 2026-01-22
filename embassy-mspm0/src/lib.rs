@@ -30,7 +30,7 @@ pub mod trng;
 pub mod uart;
 pub mod wwdt;
 
-// TODO: add feature flag for this.
+#[cfg(canfd)]
 pub mod can;
 
 /// Operating modes for peripherals.
