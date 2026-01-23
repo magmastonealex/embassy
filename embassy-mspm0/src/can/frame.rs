@@ -59,7 +59,7 @@ impl Frame for MCanFrame {
 
         Some(MCanFrame {
             id: id.into(),
-            dlc: dlc,
+            dlc,
             is_remote: true,
             data: [0u8; MAX_DATA_LEN],
         })
@@ -77,7 +77,7 @@ impl Frame for MCanFrame {
     }
 
     fn data(&self) -> &[u8] {
-        &self.data
+        &self.data[..self.dlc]
     }
 
     fn is_remote_frame(&self) -> bool {
@@ -97,12 +97,12 @@ impl From<RxBufferElement> for MCanFrame {
             Id::Standard(unsafe { StandardId::new_unchecked(id_shifted) })
         };
 
-        // should always be true given how the peripheral is configured, but you never know.
-        assert!(value.rxhdr.dlc() <= 8);
+        // Clamp DLC to valid range in case peripheral returns invalid value
+        let dlc = core::cmp::min(value.rxhdr.dlc() as usize, 8);
 
         MCanFrame {
-            id: id,
-            dlc: value.rxhdr.dlc() as usize,
+            id,
+            dlc,
             is_remote: value.hdr.rtr(),
             data: value.data,
         }

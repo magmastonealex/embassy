@@ -34,7 +34,7 @@ pub trait Instance: SealedInstance + PeripheralType {}
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ClockDiv {
-    //. Do not divide clock source.
+    // Do not divide clock source.
     DivBy1,
     /// Divide clock source by 2.
     DivBy2,
@@ -49,16 +49,34 @@ pub enum ClockDiv {
 /// This crate handles this for you, so the values in this struct should be the actual values you wish to use.
 /// Strongly suggest using the from_bitrate function to determine values here.
 pub struct CanTimings {
-    pub brp: u16,
     /// Bitrate prescaler, valid values 1-512.
-    pub sjw: u8,
+    pub brp: u16,
     /// Sync Jump Width - valid values 1-128, though must also be <= ntseg2.
-    pub ntseg1: u16, // Segment 1 time. Valid values are 2-256
-    pub ntseg2: u8, // Segment 2 time. Valid values are 2-128.
+    pub sjw: u8,
+    /// Segment 1 time. Valid values are 2-256
+    pub ntseg1: u16,
+    /// Segment 2 time. Valid values are 2-128.
+    pub ntseg2: u8,
 }
 
 impl CanTimings {
     pub const fn from_values(brp: u16, sjw: u8, ntseg1: u16, ntseg2: u8) -> Option<CanTimings> {
+        if brp < 1 || brp > 512 {
+            return None;
+        }
+        if sjw < 1 || sjw > 128 {
+            return None;
+        }
+        if ntseg1 < 2 || ntseg1 > 256 {
+            return None;
+        }
+        if ntseg2 < 2 || ntseg2 > 128 {
+            return None;
+        }
+        if sjw > ntseg2 {
+            return None;
+        }
+
         Some(CanTimings {
             brp,
             sjw,
@@ -156,6 +174,25 @@ pub enum RecoveryFailure {
     WasNotBusOff,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ErrorCounters {
+    /// Transmit error counter
+    pub tec: u8,
+    /// Receive Error Counter.
+    pub rec: u8,
+    /// CAN Error Logging. The counter is incremented each time when a CAN protocol error causes the Transmit Error Counter or the Receive Error Counter to be incremented.
+    /// Note that this is cleared when read (thus get_error_counters takes a mutable reference.)
+    pub cel: u8,
+
+    /// If the CAN peripheral has disconnected itself from the bus due to too many errors.
+    /// Reset using `recover()`.
+    pub bus_off: bool,
+
+    /// If the CAN peripheral has encountered too many receive errors and has entered a passive state (no longer sending error frames)
+    pub error_passive: bool,
+}
+
 pub struct Can<'d, M: Mode> {
     info: &'static Info,
     _rx: Option<Peri<'d, AnyPin>>,
@@ -240,7 +277,7 @@ impl<'d> Can<'d, Blocking> {
 
     pub fn enqueue_frame_blocking(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
         loop {
-            if let Some(_) = self.enqueue_frame(frame) {
+            if self.enqueue_frame(frame).is_some() {
                 return Ok(());
             }
 
@@ -287,14 +324,14 @@ impl<'d> embedded_can::nb::Can for Can<'d, Blocking> {
     }
 
     fn transmit(&mut self, frame: &Self::Frame) -> embedded_hal_nb::nb::Result<Option<Self::Frame>, Self::Error> {
-        if let None = self.enqueue_frame(frame) {
+        if self.enqueue_frame(frame).is_none() {
             // TODO: The trait suggests re-ordering the TX queue at this point to replace a lower-priority frame.
             // I am not convinced that is a sound operation in this case as we don't know which frame MCAN is currently
             // transmitting.
             return Err(embedded_hal_nb::nb::Error::WouldBlock);
         }
 
-        return Ok(None);
+        Ok(None)
     }
 }
 
@@ -490,6 +527,8 @@ impl<'d, M: Mode> Can<'d, M> {
                 } else {
                     w.set_anfe(0b10); // Reject extended frames.
                 }
+                // Remote frame rejection: rrfs rejects standard ID remote frames, rrfe rejects extended ID remote frames.
+                // Only accept extended remote frames if we're accepting extended IDs in the first place.
                 w.set_rrfs(!config.accept_remote_frames); // Reject remote frames with 11-bit IDs?
                 w.set_rrfe(!(config.accept_remote_frames && config.accept_extended_ids)); // reject remote frames with extended IDs?
             });
@@ -568,6 +607,8 @@ impl<'d, M: Mode> Can<'d, M> {
         cur_status.f0gi() != cur_status.f0pi() || cur_status.f0f()
     }
 
+    /// Convert a Last Error Code (LEC) register value to a BusError.
+    /// Returns None for value 0 (no error) and values 7+ (reserved/no error).
     fn reg_to_error(value: u8) -> Option<BusError> {
         match value {
             1 => Some(BusError::Stuff),
@@ -579,6 +620,22 @@ impl<'d, M: Mode> Can<'d, M> {
             _ => None,
         }
     }
+
+    /// Retrieve error counters from the CAN peripheral.
+    /// Note this is mutable as the `cel` field is cleared upon read.
+    pub fn get_error_counters(&mut self) -> ErrorCounters {
+        let status = self.info.regs.mcan(0).psr().read();
+        let counters = self.info.regs.mcan(0).ecr().read();
+
+        ErrorCounters {
+            tec: counters.tec(),
+            rec: counters.rec(),
+            cel: counters.cel(),
+
+            bus_off: status.bo(),
+            error_passive: status.ep()
+        }
+    } 
 
     /// Determine the current error status of the peripheral.
     /// If any errors have been detected, they will be returned.
