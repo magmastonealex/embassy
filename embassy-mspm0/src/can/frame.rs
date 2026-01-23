@@ -1,3 +1,6 @@
+//! Implementations for CAN frame accessors
+//! Meets the embedded_can Frame trait, and supports
+//! conversion to and from hardware representation.
 use embedded_can::{ExtendedId, Frame, Id, StandardId};
 
 use crate::can::msgram::{MAX_DATA_LEN, MsgHeader, RxBufferElement, TxBufferElement, TxHeader};

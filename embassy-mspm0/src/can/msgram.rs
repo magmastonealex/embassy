@@ -1,3 +1,11 @@
+//! Structures and accesors for MCAN configuration and message RAM areas.
+//! This module provides structure definitions for each type of element in MCAN message RAM
+//! and utility functions to access them.
+//! 
+//! Similar to a PAC - this module exposes a somewhat unsound API - there are methods which take immutable references
+//! yet do mutate data - this unsafe interior mutability is identical to what chiptools PACs do, but means use of this module
+//! requires significant extra care to make sure the methods can't be accessed from multiple places at once.
+
 use bitfield::bitfield;
 
 /// Maximum data allowed in RX or TX frames.

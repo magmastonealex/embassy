@@ -1,3 +1,25 @@
+//! MCAN/CANFD peripheral support
+//! 
+//! This is a minimal driver for the CANFD peripheral on MSPM0.
+//! It supports basic message sending and receiving in blocking or non-blocking mode.
+//! 
+//! A simple example can be found in embassy/examples/mspm0g3107. 
+//! 
+//! A key limitation for this implementation is clocking - it is hard-coded to be clocked
+//! from SYSPLL's CLKOUT1. This crate initializes SYSPLL automatically to 32MHz to provide a
+//! functional clock to this peripheral (functional clock must be <= MCLK, MCLK is fixed at 32MHz for now)
+//! There will eventually be broader clocking improvements in this HAL which will bring more flexibility
+//! 
+//! At this time, it additionally does _not_ support:
+//!  - Async operation (in progress, but not yet implemented)
+//!  - CAN-FD
+//!  - Filtering
+//!  - TX confirmation
+//!  - More complex clocking (see above)
+//!  - Bitrate calculations
+//! 
+//! 
+
 #![macro_use]
 
 use core::marker::PhantomData;
@@ -47,7 +69,6 @@ pub enum ClockDiv {
 /// Structure to encode CAN timing parameter information.
 /// Note that the hardware adds '1' to each of the values placed in the registers of the peripheral.
 /// This crate handles this for you, so the values in this struct should be the actual values you wish to use.
-/// Strongly suggest using the from_bitrate function to determine values here.
 pub struct CanTimings {
     /// Bitrate prescaler, valid values 1-512.
     pub brp: u16,
@@ -88,7 +109,7 @@ impl CanTimings {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-/// CAN Configuration
+/// CAN Configuration details
 pub struct Config {
     /// Input clock divider
     pub clock_div: ClockDiv,
@@ -96,9 +117,30 @@ pub struct Config {
     /// CAN timings to use for standard CAN. (CAN-FD support to come later.)
     pub timing: CanTimings,
 
+    /// If remote frames should be accepted into the RX queue.
     pub accept_remote_frames: bool,
 
+    /// If extended ID frames should be accepted into the RX queue.
     pub accept_extended_ids: bool,
+}
+
+impl Default for Config {
+    /// Will set up a bitrate of 100 kbit/s assuming 32MHz clock,
+    /// accepting extended-ID frames but rejecting all remote frames.
+    fn default() -> Self {
+
+        // CAN timings:
+        // 32MHz input clock
+        // 100 000 bit/s, sample point ~87.5%
+        // 69+1+10 =  80 tq per bit.
+        Self {
+            clock_div: ClockDiv::DivBy1,
+            accept_extended_ids: true,
+            accept_remote_frames: false,
+            //timing: CanTimings::from_values(2, 20, 139, 20).unwrap(),
+            timing: CanTimings::from_values(1, 31, 218, 31).unwrap(),
+        }
+    }
 }
 
 #[non_exhaustive]
@@ -201,6 +243,8 @@ pub struct Can<'d, M: Mode> {
 }
 
 impl<'d> Can<'d, Blocking> {
+    /// Create a new instance of the peripheral.
+    /// 
     /// The "Blocking" CAN instance actually implements both the blocking and non-blocking embedded-can traits.
     /// the nb traits either work or do not and aren't actually async.
     /// The Async version of this driver will offer options to properly handle asynchronous work.
@@ -213,6 +257,8 @@ impl<'d> Can<'d, Blocking> {
         Self::new_inner(peri, rx, tx, config)
     }
 
+    /// Attempt to retrieve a frame from the peripheral.
+    /// Returns None if there is not currently a frame available to read.
     pub fn get_frame(&mut self) -> Option<MCanFrame> {
         let cur_status = self.info.regs.mcan(0).rxf0s().read();
         if cur_status.f0gi() == cur_status.f0pi() && !cur_status.f0f() {
@@ -235,7 +281,8 @@ impl<'d> Can<'d, Blocking> {
     }
 
     /// Retrieve a frame from the peripheral in a blocking fashion.
-    /// Will return a BusError if the peripheral enters bus-off state.
+    /// Will return a BusError if the peripheral enters bus-off state,
+    /// otherwise will block indefinitely.
     pub fn get_frame_blocking(&mut self) -> Result<MCanFrame, BusError> {
         loop {
             if let Some(frame) = self.get_frame() {
@@ -252,6 +299,11 @@ impl<'d> Can<'d, Blocking> {
         }
     }
 
+    /// Attempt to enqueue a frame to be sent on the bus.
+    /// If the transmit queue is full, will return None.
+    /// 
+    /// Note that a successful return does _not_ mean the frame was transmitted successfully
+    /// (see module comment - TX confirmation is not currently implemented.)
     pub fn enqueue_frame(&mut self, frame: &MCanFrame) -> Option<()> {
         let cur_status = self.info.regs.mcan(0).txfqs().read();
         if cur_status.tfqf() {
@@ -275,6 +327,10 @@ impl<'d> Can<'d, Blocking> {
         Some(())
     }
 
+    /// Enqueue a frame to be sent on the bus, blocking until space is available in the transmit queue.
+    /// 
+    /// Note that a successful return does _not_ mean the frame was transmitted successfully
+    /// (see module comment - TX confirmation is not currently implemented.)
     pub fn enqueue_frame_blocking(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
         loop {
             if self.enqueue_frame(frame).is_some() {
@@ -361,7 +417,12 @@ impl<'d, M: Mode> Can<'d, M> {
             w.set_enable(true);
             w.set_key(CanVals::PwrenKey::KEY);
         });
-        cortex_m::asm::delay(4000); // TODO: this should be calculated from MCLK at some point as 50us.
+        cortex_m::asm::delay(10000); // TODO: this should be calculated from MCLK at some point as 50us.
+
+        pac::SYSCTL.genclkcfg().modify(|w| {
+            //w.set_canclksrc(pac::sysctl::vals::Canclksrc::SYSPLLOUT1);
+            w.set_canclksrc(pac::sysctl::vals::Canclksrc::HFCLK);
+        });
 
         // again, not in reference manual and not required for other peripherals, but you need to now turn on the clock request signal.
         can.ti_wrapper(0).msp(0).subsys_clken().write(|w| {
@@ -377,10 +438,6 @@ impl<'d, M: Mode> Can<'d, M> {
             });
         });
 
-        pac::SYSCTL.genclkcfg().modify(|w| {
-            w.set_canclksrc(pac::sysctl::vals::Canclksrc::SYSPLLOUT1);
-        });
-
         // Wait for async reset to be complete.
         let mut iter = 0;
         while can
@@ -392,6 +449,7 @@ impl<'d, M: Mode> Can<'d, M> {
             .reset()
         {
             if iter > 1000 {
+                defmt::info!("reset not completed");
                 return Err(InitializationError::PeripheralTimedOut);
             }
             iter += 1;
@@ -399,8 +457,8 @@ impl<'d, M: Mode> Can<'d, M> {
         }
 
         // Wait for "memory initialization" to be complete. I think this is zeroing the internal message RAM.
-        iter = 0;
-        while can
+        let mut iter = 0;
+        while !can
             .ti_wrapper(0)
             .processors(0)
             .subsys_regs(0)
@@ -408,16 +466,18 @@ impl<'d, M: Mode> Can<'d, M> {
             .read()
             .mem_init_done()
         {
-            if iter > 1000 {
+            if iter > 10000 {
+                defmt::info!("resmem initet not completed");
                 return Err(InitializationError::PeripheralTimedOut);
             }
             iter += 1;
-            cortex_m::asm::delay(1000);
+            cortex_m::asm::delay(10000);
         }
 
         // Sanity check the peripheral came up correctly by reading the release version register.
         let crel = can.mcan(0).crel().read();
         if crel.0 == 0x00 {
+            defmt::info!("crel initet not completed");
             return Err(InitializationError::PeripheralTimedOut);
         }
         debug!(
@@ -453,6 +513,7 @@ impl<'d, M: Mode> Can<'d, M> {
         let mut iter = 0;
         while !can.mcan(0).cccr().read().init() {
             if iter > 10000 {
+                defmt::info!("init initet not completed");
                 return Err(InitializationError::PeripheralTimedOut);
             }
             iter += 1;
@@ -478,6 +539,7 @@ impl<'d, M: Mode> Can<'d, M> {
             iter = 0;
             while can.mcan(0).cccr().read().init() {
                 if iter > 10000 {
+                    defmt::info!("init rst not completed");
                     return Err(InitializationError::PeripheralTimedOut);
                 }
                 iter += 1;
@@ -602,6 +664,7 @@ impl<'d, M: Mode> Can<'d, M> {
         })
     }
 
+    /// Check if a frame is available to be read from the peripheral.
     pub fn has_frame(&self) -> bool {
         let cur_status = self.info.regs.mcan(0).rxf0s().read();
         cur_status.f0gi() != cur_status.f0pi() || cur_status.f0f()
