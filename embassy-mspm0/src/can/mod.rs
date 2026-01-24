@@ -32,9 +32,11 @@ use crate::Peri;
 use crate::can::frame::MCanFrame;
 use crate::can::msgram::{McanMessageRAM, MessageRAMAccess};
 use crate::gpio::{AnyPin, PfType};
+use crate::interrupt::Interrupt;
 use crate::mode::{Blocking, Mode};
 use crate::pac::canfd::{Canfd as Regs, vals};
 use crate::pac::{self};
+use embassy_sync::waitqueue::AtomicWaker;
 
 pub(crate) mod msgram;
 
@@ -42,17 +44,26 @@ pub mod frame;
 
 pub(crate) struct Info {
     // metadata/details about the specific instance of the peripheral in use.
-    pub(crate) regs: Regs, // the registers for this specific instance
+    pub(crate) regs: Regs,           // the registers for this specific instance
+    pub(crate) interrupt: Interrupt, // which interrupt applies to this peripheral
     pub(crate) mem: MessageRAMAccess,
+}
+
+pub(crate) struct State {
+    // waker for when interesting things happen, I guess.
+    pub(crate) waker: AtomicWaker,
 }
 
 // prevent external callers from creating instances of this.
 pub(crate) trait SealedInstance {
     fn info() -> &'static Info;
+    fn state() -> &'static State;
 }
 
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + PeripheralType {}
+pub trait Instance: SealedInstance + PeripheralType {
+    type Interrupt: crate::interrupt::typelevel::Interrupt;
+}
 
 /// Functional clock divider - consider this as an additional few bits on top of the bitrate prescaler if needed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -248,6 +259,7 @@ pub struct ErrorCounters {
 
 pub struct Can<'d, M: Mode> {
     info: &'static Info,
+    state: &'static State,
     _rx: Option<Peri<'d, AnyPin>>,
     _tx: Option<Peri<'d, AnyPin>>,
     _phantom: PhantomData<M>,
@@ -659,6 +671,7 @@ impl<'d, M: Mode> Can<'d, M> {
 
         Ok(Can {
             info: T::info(),
+            state: T::state(),
             _rx: rx_inner,
             _tx: tx_inner,
             _phantom: PhantomData,
@@ -782,9 +795,11 @@ macro_rules! impl_can_instance {
         impl crate::can::SealedInstance for crate::peripherals::$instance {
             fn info() -> &'static crate::can::Info {
                 use crate::can::Info;
+                use crate::interrupt::typelevel::Interrupt;
 
                 const INFO: Info = Info {
                     regs: crate::pac::$instance,
+                    interrupt: crate::interrupt::typelevel::$instance::IRQ,
                     // mild voodoo - message RAM lives at the beginning of the address space of the MCAN peripheral, in a gap in the
                     // SVD between the base address and first documented register.
                     // Re-use the same register base address.
@@ -793,10 +808,19 @@ macro_rules! impl_can_instance {
 
                 &INFO
             }
+
+            fn state() -> &'static crate::can::State {
+                use crate::can::State;
+                static STATE: State = State {
+                    waker: embassy_sync::waitqueue::AtomicWaker::new(),
+                };
+
+                &STATE
+            }
         }
 
         impl crate::can::Instance for crate::peripherals::$instance {
-            // TODO: This will be expanded when async support is added to include the specific interrupt used for this peripheral.
+            type Interrupt = crate::interrupt::typelevel::$instance;
         }
     };
 }
