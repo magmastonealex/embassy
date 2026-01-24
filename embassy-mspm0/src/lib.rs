@@ -176,7 +176,6 @@ impl Default for Config {
     }
 }
 
-
 /// Read the PLL startup calibration values from the FACTORY region,
 /// given an expected f_loopin frequency.
 /// Returns SYSPLLPARAM0, SYSPLLPARAM1.
@@ -188,28 +187,19 @@ fn load_pll_values(f_loopin: u32) -> Option<(u32, u32)> {
     // Taken from table "Table 1-135. FACTORYREGION_TYPEG Registers"
     // (constants identical to Table 1-116. FACTORYREGION_TYPEA Registers for PLL.)
     let addrs: (u32, u32) = match f_loopin {
-        4_000_000..=8_000_000 => {
-            (0x41C4_001C, 0x41C4_0020)
-        },
-        8_000_001..=16_000_000 => {
-            (0x41C4_0024, 0x41C4_0028)
-        },
-        16_000_001..=32_000_000 => {
-            (0x41C4_002C, 0x41C4_0030)
-        },
-        32_000_001..48_000_000 => {
-            (0x41C4_0034, 0x41C4_0038)
-        },
+        4_000_000..=8_000_000 => (0x41C4_001C, 0x41C4_0020),
+        8_000_001..=16_000_000 => (0x41C4_0024, 0x41C4_0028),
+        16_000_001..=32_000_000 => (0x41C4_002C, 0x41C4_0030),
+        32_000_001..48_000_000 => (0x41C4_0034, 0x41C4_0038),
         _ => {
             return None;
         }
     };
 
-    let param0 = unsafe { core::ptr::read_volatile(addrs.0 as *const u32)};
-    let param1 = unsafe { core::ptr::read_volatile(addrs.1 as *const u32)};
+    let param0 = unsafe { core::ptr::read_volatile(addrs.0 as *const u32) };
+    let param1 = unsafe { core::ptr::read_volatile(addrs.1 as *const u32) };
 
     Some((param0, param1))
-
 }
 
 /// This is a minimal initialization for the PLL
@@ -238,22 +228,25 @@ fn enable_pll() {
     // This is a very convoluted way to route the SYSOSC to the CANFD functional clock,
     // but the only way supported with the clock tree we have.
     // This is a stopgap to get CANFD working without too many external components.
-    
+
     pac::SYSCTL.syspllcfg0().modify(|w| {
         w.set_syspllref(pac::sysctl::vals::Syspllref::SYSOSC); // SYSOSC as PLL reference.
         w.set_enableclk1(true); // SYSPLLCLK1 goes to CANFD as functional clock.
         w.set_rdivclk1(pac::sysctl::vals::Rdivclk1::CLK1DIV4);
-
     });
-    
+
     pac::SYSCTL.syspllcfg1().modify(|w| {
         w.set_pdiv(pac::sysctl::vals::Pdiv::REFDIV1); // Divide input clock by 1
         w.set_qdiv(pac::sysctl::vals::Qdiv::from(3)); // Register value 3 results in /4 (causes VCO to be 4x reference clock = 128MHZ in this case)
     });
 
     let params = load_pll_values(32_000_000).unwrap();
-    pac::SYSCTL.syspllparam0().write_value(pac::sysctl::regs::Syspllparam0(params.0));
-    pac::SYSCTL.syspllparam1().write_value(pac::sysctl::regs::Syspllparam1(params.1));
+    pac::SYSCTL
+        .syspllparam0()
+        .write_value(pac::sysctl::regs::Syspllparam0(params.0));
+    pac::SYSCTL
+        .syspllparam1()
+        .write_value(pac::sysctl::regs::Syspllparam1(params.1));
 
     pac::SYSCTL.hsclken().modify(|w| {
         w.set_syspllen(true);
@@ -287,7 +280,7 @@ fn enable_pll() {
         if count.abs_diff(32_000_000 / 32_768) < 10 {
             break;
         }
-        
+
         warn!("PLL failed to lock - retrying. Actual frequency: {}", count * 32768);
 
         pac::SYSCTL.hsclken().modify(|w| {
@@ -306,8 +299,6 @@ fn enable_pll() {
             cortex_m::asm::delay(16);
         }
     }
-    
-
 }
 
 pub fn init(config: Config) -> Peripherals {

@@ -733,7 +733,7 @@ fn select_sysctl_features(cfgs: &mut CfgSet) {
     match sysctl.version {
         Some("g350x_g310x_g150x_g110x") | Some("g351x_g151x") => {
             cfgs.enable("sysctl_syspll");
-        },
+        }
         _ => {}
     }
 }

@@ -1,15 +1,15 @@
 //! MCAN/CANFD peripheral support
-//! 
+//!
 //! This is a minimal driver for the CANFD peripheral on MSPM0.
 //! It supports basic message sending and receiving in blocking or non-blocking mode.
-//! 
-//! A simple example can be found in embassy/examples/mspm0g3107. 
-//! 
+//!
+//! A simple example can be found in embassy/examples/mspm0g3107.
+//!
 //! A key limitation for this implementation is clocking - it is hard-coded to be clocked
 //! from SYSPLL's CLKOUT1. This crate initializes SYSPLL automatically to 32MHz to provide a
 //! functional clock to this peripheral (functional clock must be <= MCLK, MCLK is fixed at 32MHz for now)
 //! There will eventually be broader clocking improvements in this HAL which will bring more flexibility
-//! 
+//!
 //! At this time, it additionally does _not_ support:
 //!  - Async operation (in progress, but not yet implemented)
 //!  - CAN-FD
@@ -17,8 +17,8 @@
 //!  - TX confirmation
 //!  - More complex clocking (see above)
 //!  - Bitrate calculations
-//! 
-//! 
+//!
+//!
 
 #![macro_use]
 
@@ -128,7 +128,6 @@ impl Default for Config {
     /// Will set up a bitrate of 100 kbit/s assuming 32MHz clock,
     /// accepting extended-ID frames but rejecting all remote frames.
     fn default() -> Self {
-
         // CAN timings:
         // 32MHz input clock
         // 100 000 bit/s, sample point ~87.5%
@@ -138,7 +137,7 @@ impl Default for Config {
             accept_extended_ids: true,
             accept_remote_frames: false,
             //timing: CanTimings::from_values(2, 20, 139, 20).unwrap(),
-            timing: CanTimings::from_values(1, 31, 218, 31).unwrap(),
+            timing: CanTimings::from_values(1, 30, 219, 30).unwrap(),
         }
     }
 }
@@ -244,7 +243,7 @@ pub struct Can<'d, M: Mode> {
 
 impl<'d> Can<'d, Blocking> {
     /// Create a new instance of the peripheral.
-    /// 
+    ///
     /// The "Blocking" CAN instance actually implements both the blocking and non-blocking embedded-can traits.
     /// the nb traits either work or do not and aren't actually async.
     /// The Async version of this driver will offer options to properly handle asynchronous work.
@@ -301,7 +300,7 @@ impl<'d> Can<'d, Blocking> {
 
     /// Attempt to enqueue a frame to be sent on the bus.
     /// If the transmit queue is full, will return None.
-    /// 
+    ///
     /// Note that a successful return does _not_ mean the frame was transmitted successfully
     /// (see module comment - TX confirmation is not currently implemented.)
     pub fn enqueue_frame(&mut self, frame: &MCanFrame) -> Option<()> {
@@ -328,7 +327,7 @@ impl<'d> Can<'d, Blocking> {
     }
 
     /// Enqueue a frame to be sent on the bus, blocking until space is available in the transmit queue.
-    /// 
+    ///
     /// Note that a successful return does _not_ mean the frame was transmitted successfully
     /// (see module comment - TX confirmation is not currently implemented.)
     pub fn enqueue_frame_blocking(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
@@ -449,7 +448,6 @@ impl<'d, M: Mode> Can<'d, M> {
             .reset()
         {
             if iter > 1000 {
-                defmt::info!("reset not completed");
                 return Err(InitializationError::PeripheralTimedOut);
             }
             iter += 1;
@@ -467,7 +465,6 @@ impl<'d, M: Mode> Can<'d, M> {
             .mem_init_done()
         {
             if iter > 10000 {
-                defmt::info!("resmem initet not completed");
                 return Err(InitializationError::PeripheralTimedOut);
             }
             iter += 1;
@@ -477,7 +474,6 @@ impl<'d, M: Mode> Can<'d, M> {
         // Sanity check the peripheral came up correctly by reading the release version register.
         let crel = can.mcan(0).crel().read();
         if crel.0 == 0x00 {
-            defmt::info!("crel initet not completed");
             return Err(InitializationError::PeripheralTimedOut);
         }
         debug!(
@@ -513,7 +509,6 @@ impl<'d, M: Mode> Can<'d, M> {
         let mut iter = 0;
         while !can.mcan(0).cccr().read().init() {
             if iter > 10000 {
-                defmt::info!("init initet not completed");
                 return Err(InitializationError::PeripheralTimedOut);
             }
             iter += 1;
@@ -539,7 +534,6 @@ impl<'d, M: Mode> Can<'d, M> {
             iter = 0;
             while can.mcan(0).cccr().read().init() {
                 if iter > 10000 {
-                    defmt::info!("init rst not completed");
                     return Err(InitializationError::PeripheralTimedOut);
                 }
                 iter += 1;
@@ -696,9 +690,9 @@ impl<'d, M: Mode> Can<'d, M> {
             cel: counters.cel(),
 
             bus_off: status.bo(),
-            error_passive: status.ep()
+            error_passive: status.ep(),
         }
-    } 
+    }
 
     /// Determine the current error status of the peripheral.
     /// If any errors have been detected, they will be returned.
