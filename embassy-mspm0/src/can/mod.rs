@@ -33,7 +33,7 @@ use crate::can::frame::MCanFrame;
 use crate::can::msgram::{McanMessageRAM, MessageRAMAccess};
 use crate::gpio::{AnyPin, PfType};
 use crate::interrupt::Interrupt;
-use crate::mode::{Blocking, Mode};
+use crate::mode::{Blocking, Async, Mode};
 use crate::pac::canfd::{Canfd as Regs, vals};
 use crate::pac::{self};
 use embassy_sync::waitqueue::AtomicWaker;
@@ -406,6 +406,21 @@ impl<'d> embedded_can::nb::Can for Can<'d, Blocking> {
 
         Ok(None)
     }
+}
+
+impl<'d> Can<'d, Async> { 
+
+    /// Enqueue the frame for sending. The future will resolve when the item
+    /// is placed into the queue successfully and conveys no information
+    /// as to the successful transmission of the frame.
+    async fn transmit_unconfirmed(frame: &MCanFrame) {}
+
+    /// Transmit will send the provided frame onto the bus,
+    /// and will only resolve the future when the frame is actually sent.
+    /// I'd like for Drop/cancellation to attempt to prevent the frame from being sent,
+    /// but I don't know if I can really get the concurrency right there.
+    async fn transmit(frame: &MCanFrame) {}
+
 }
 
 impl<'d, M: Mode> Can<'d, M> {
