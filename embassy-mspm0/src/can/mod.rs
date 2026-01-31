@@ -24,16 +24,19 @@
 
 #![macro_use]
 
+use core::future;
 use core::marker::PhantomData;
 
+use crate::interrupt::typelevel::Binding;
 use embassy_hal_internal::PeripheralType;
+use embassy_hal_internal::interrupt::InterruptExt;
 
 use crate::Peri;
 use crate::can::frame::MCanFrame;
 use crate::can::msgram::{McanMessageRAM, MessageRAMAccess};
 use crate::gpio::{AnyPin, PfType};
 use crate::interrupt::Interrupt;
-use crate::mode::{Blocking, Async, Mode};
+use crate::mode::{Async, Blocking, Mode};
 use crate::pac::canfd::{Canfd as Regs, vals};
 use crate::pac::{self};
 use embassy_sync::waitqueue::AtomicWaker;
@@ -41,6 +44,16 @@ use embassy_sync::waitqueue::AtomicWaker;
 pub(crate) mod msgram;
 
 pub mod frame;
+
+// Async operation will use the hardware FIFOs.
+// rx_waker will wake up anything waiting for frames to read out a frame.
+// tx_waker will wake up anything waiting for space in the TX fifo.
+// I would like to have a way to split() this into a Receiver and Transmitter,
+// since they touch different areas of memory and can safely operate without knowing about one another.
+// I think that's true of the Blocking version as well.
+// At some point, that split() can become a split_multi to create _two_ receivers one for each RX FIFO,
+// or even a way for a transmitter to be forked off for the dedicated TX buffers?
+// Let's get the async logic working first then revisit.
 
 pub(crate) struct Info {
     // metadata/details about the specific instance of the peripheral in use.
@@ -50,8 +63,11 @@ pub(crate) struct Info {
 }
 
 pub(crate) struct State {
-    // waker for when interesting things happen, I guess.
-    pub(crate) waker: AtomicWaker,
+    /// Waker for when a frame has been received and can be read from the FIFO.
+    pub(crate) rx_waker: AtomicWaker,
+
+    /// Waker for when a frame has been transmitted successfully (indicating a new frame can likely be placed in the FIFO.)
+    pub(crate) tx_waker: AtomicWaker,
 }
 
 // prevent external callers from creating instances of this.
@@ -63,6 +79,53 @@ pub(crate) trait SealedInstance {
 #[allow(private_bounds)]
 pub trait Instance: SealedInstance + PeripheralType {
     type Interrupt: crate::interrupt::typelevel::Interrupt;
+}
+
+pub struct InterruptHandler<T: Instance> {
+    _can: PhantomData<T>,
+}
+
+impl<T: Instance> crate::interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        // interrupt from CANFD - why?
+        let mis = T::info().regs.ti_wrapper(0).msp(0).cpu_int(0).mis().read();
+
+        if mis.intl0() {
+            // Current interrupt reasons are either TX complete indicating there will be room in the FIFO for a new frame,
+            // or RX new entry indicating a starved reader can now read.
+            let flags = T::info().regs.mcan(0).ir().read();
+
+            if flags.tc() {
+                T::state().tx_waker.wake();
+                debug!("tx complete");
+                T::info().regs.mcan(0).ir().write(|w| w.set_tc(true));
+            }
+
+            if flags.rf0n() {
+                T::state().rx_waker.wake();
+                debug!("rx new");
+                T::info().regs.mcan(0).ir().write(|w| w.set_rf0n(true))
+            }
+        }
+
+        // clear interrupt register in the wrapper.
+        T::info().regs.ti_wrapper(0).msp(0).cpu_int(0).iclr().write(|w| {
+            w.set_intl0(mis.intl0());
+        });
+
+        // mark interrupt as complered in the wrapper/subsystem.
+        // If you don't do this, you will not get another interrupt.
+        // note the ECC stuff is a separate register but comes to the same ISR - see "26.4.14.4 ECC Interrupts".
+        T::info()
+            .regs
+            .ti_wrapper(0)
+            .processors(0)
+            .subsys_regs(0)
+            .subsys_eoi()
+            .write(|w| {
+                w.set_eoi(0x01); // MCAN(0) (int line 0) cleared.
+            });
+    }
 }
 
 /// Functional clock divider - consider this as an additional few bits on top of the bitrate prescaler if needed.
@@ -280,35 +343,12 @@ impl<'d> Can<'d, Blocking> {
         Self::new_inner(peri, rx, tx, config)
     }
 
-    /// Attempt to retrieve a frame from the peripheral.
-    /// Returns None if there is not currently a frame available to read.
-    pub fn get_frame(&mut self) -> Option<MCanFrame> {
-        let cur_status = self.info.regs.mcan(0).rxf0s().read();
-        if cur_status.f0gi() == cur_status.f0pi() && !cur_status.f0f() {
-            return None;
-        }
-        let read_index = cur_status.f0gi();
-
-        let element = self
-            .info
-            .mem
-            .get_rx_fifo_element(read_index as usize)
-            .expect("invalid read index - bad peripheral config?");
-
-        // mark the element as acknowledged.
-        self.info.regs.mcan(0).rxf0a().write(|w| {
-            w.set_f0ai(read_index);
-        });
-
-        Some(element.into())
-    }
-
     /// Retrieve a frame from the peripheral in a blocking fashion.
     /// Will return a BusError if the peripheral enters bus-off state,
     /// otherwise will block indefinitely.
     pub fn get_frame_blocking(&mut self) -> Result<MCanFrame, BusError> {
         loop {
-            if let Some(frame) = self.get_frame() {
+            if let Some(frame) = self.try_get_frame() {
                 return Ok(frame);
             }
 
@@ -319,41 +359,13 @@ impl<'d> Can<'d, Blocking> {
         }
     }
 
-    /// Attempt to enqueue a frame to be sent on the bus.
-    /// If the transmit queue is full, will return None.
-    ///
-    /// Note that a successful return does _not_ mean the frame was transmitted successfully
-    /// (see module comment - TX confirmation is not currently implemented.)
-    pub fn enqueue_frame(&mut self, frame: &MCanFrame) -> Option<()> {
-        let cur_status = self.info.regs.mcan(0).txfqs().read();
-        if cur_status.tfqf() {
-            // TX queue is full already.
-            // TODO: Consider trying to replace a lower-priority item in the future.
-            return None;
-        }
-
-        let txbuf = frame.to_tx_buffer(None); // note we do not support TX events yet.
-        let write_index = cur_status.tfqp();
-        self.info
-            .mem
-            .set_tx_element(write_index as usize, txbuf)
-            .expect("invalid write index - bad periph config?");
-
-        // tell the peripheral we've written a new entry into the TX FIFO.
-        self.info.regs.mcan(0).txbar().write(|w| {
-            w.0 = 1 << write_index;
-        });
-
-        Some(())
-    }
-
     /// Enqueue a frame to be sent on the bus, blocking until space is available in the transmit queue.
     ///
     /// Note that a successful return does _not_ mean the frame was transmitted successfully
     /// (see module comment - TX confirmation is not currently implemented.)
     pub fn enqueue_frame_blocking(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
         loop {
-            if self.enqueue_frame(frame).is_some() {
+            if self.try_enqueue_frame(frame).is_some() {
                 return Ok(());
             }
 
@@ -390,14 +402,14 @@ impl<'d> embedded_can::nb::Can for Can<'d, Blocking> {
     type Error = BusError;
     type Frame = MCanFrame;
     fn receive(&mut self) -> embedded_hal_nb::nb::Result<Self::Frame, Self::Error> {
-        match self.get_frame() {
+        match self.try_get_frame() {
             Some(frame) => Ok(frame),
             None => Err(embedded_hal_nb::nb::Error::WouldBlock),
         }
     }
 
     fn transmit(&mut self, frame: &Self::Frame) -> embedded_hal_nb::nb::Result<Option<Self::Frame>, Self::Error> {
-        if self.enqueue_frame(frame).is_none() {
+        if self.try_enqueue_frame(frame).is_none() {
             // TODO: The trait suggests re-ordering the TX queue at this point to replace a lower-priority frame.
             // I am not convinced that is a sound operation in this case as we don't know which frame MCAN is currently
             // transmitting.
@@ -408,19 +420,80 @@ impl<'d> embedded_can::nb::Can for Can<'d, Blocking> {
     }
 }
 
-impl<'d> Can<'d, Async> { 
+impl<'d> Can<'d, Async> {
+    pub fn new_async<T: Instance>(
+        peri: Peri<'d, T>,
+        rx: Peri<'d, impl RxPin<T>>,
+        tx: Peri<'d, impl TxPin<T>>,
+        _irq: impl Binding<T::Interrupt, InterruptHandler<T>> + 'd,
+        config: Config,
+    ) -> Result<Self, ConfigError> {
+        let instance = Self::new_inner(peri, rx, tx, config)?;
 
-    /// Enqueue the frame for sending. The future will resolve when the item
-    /// is placed into the queue successfully and conveys no information
-    /// as to the successful transmission of the frame.
-    async fn transmit_unconfirmed(frame: &MCanFrame) {}
+        let can = T::info().regs;
 
-    /// Transmit will send the provided frame onto the bus,
-    /// and will only resolve the future when the frame is actually sent.
-    /// I'd like for Drop/cancellation to attempt to prevent the frame from being sent,
-    /// but I don't know if I can really get the concurrency right there.
-    async fn transmit(frame: &MCanFrame) {}
+        // Enable the interrupts we care about within the MCAN peripheral.
+        can.mcan(0).ie().write(|w| {
+            w.set_rf0ne(true);
+            w.set_tce(true);
+        });
 
+        // not really specified, but you have to set TX _buffer_ completion interrupts if you want to get interrupts for the TX fifo as well.
+        can.mcan(0).txbtie().write(|w| {
+            w.0 = 0xFFFF_FFFF;
+        });
+
+        //  Enable interrupt line 0 (default line for interrupts.)
+        can.mcan(0).ile().write(|w| {
+            w.set_eint0(true);
+        });
+
+        // Trigger an actual interrupt on interrupt line 0 going high.
+        can.ti_wrapper(0).msp(0).cpu_int(0).imask().write(|w| {
+            w.set_intl0(true);
+        });
+
+        // Enable interrupt 0 (otherwise interrupt does not fire - is this just more artifacts of a rough MCAN integration?)
+        can.ti_wrapper(0).msp(0).evt_mode().write(|w| {
+            w.set_int0_cfg(vals::Int0Cfg::SOFTWARE);
+        });
+
+        // not doing an unpend here, because if we don't properly clear all of the flags and set EOI, we'll never get an interrupt,
+        // and it doesn't hurt anything to hit an interrupt immediately anyways.
+        unsafe { T::info().interrupt.enable() };
+
+        Ok(instance)
+    }
+
+    /// Enqueue a frame for transmission.
+    pub async fn enqueue_frame(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
+        future::poll_fn(|cx| {
+            self.state.tx_waker.register(cx.waker());
+
+            let poll = match self.try_enqueue_frame(frame) {
+                Some(_) => core::task::Poll::Ready(Ok(())),
+                None => core::task::Poll::Pending,
+            };
+
+            return poll;
+        })
+        .await
+    }
+
+    /// Retrieve a frame from the RX queue.
+    pub async fn get_frame(&mut self) -> Result<MCanFrame, BusError> {
+        future::poll_fn(|cx| {
+            self.state.rx_waker.register(cx.waker());
+
+            let poll = match self.try_get_frame() {
+                Some(frame) => core::task::Poll::Ready(Ok(frame)),
+                None => core::task::Poll::Pending,
+            };
+
+            return poll;
+        })
+        .await
+    }
 }
 
 impl<'d, M: Mode> Can<'d, M> {
@@ -776,6 +849,56 @@ impl<'d, M: Mode> Can<'d, M> {
 
         Ok(())
     }
+
+    /// Attempt to retrieve a frame from the peripheral.
+    /// Returns None if there is not currently a frame available to read.
+    pub fn try_get_frame(&mut self) -> Option<MCanFrame> {
+        let cur_status = self.info.regs.mcan(0).rxf0s().read();
+        if cur_status.f0gi() == cur_status.f0pi() && !cur_status.f0f() {
+            return None;
+        }
+        let read_index = cur_status.f0gi();
+
+        let element = self
+            .info
+            .mem
+            .get_rx_fifo_element(read_index as usize)
+            .expect("invalid read index - bad peripheral config?");
+
+        // mark the element as acknowledged.
+        self.info.regs.mcan(0).rxf0a().write(|w| {
+            w.set_f0ai(read_index);
+        });
+
+        Some(element.into())
+    }
+    /// Attempt to enqueue a frame to be sent on the bus.
+    /// If the transmit queue is full, will return None.
+    ///
+    /// Note that a successful return does _not_ mean the frame was transmitted successfully
+    /// (see module comment - TX confirmation is not currently implemented.)
+    pub fn try_enqueue_frame(&mut self, frame: &MCanFrame) -> Option<()> {
+        let cur_status = self.info.regs.mcan(0).txfqs().read();
+        if cur_status.tfqf() {
+            // TX queue is full already.
+            // TODO: Consider trying to replace a lower-priority item in the future.
+            return None;
+        }
+
+        let txbuf = frame.to_tx_buffer(None); // note we do not support TX events yet.
+        let write_index = cur_status.tfqp();
+        self.info
+            .mem
+            .set_tx_element(write_index as usize, txbuf)
+            .expect("invalid write index - bad periph config?");
+
+        // tell the peripheral we've written a new entry into the TX FIFO.
+        self.info.regs.mcan(0).txbar().write(|w| {
+            w.0 = 1 << write_index;
+        });
+
+        Some(())
+    }
 }
 
 pub trait RxPin<T: Instance>: crate::gpio::Pin {
@@ -827,7 +950,8 @@ macro_rules! impl_can_instance {
             fn state() -> &'static crate::can::State {
                 use crate::can::State;
                 static STATE: State = State {
-                    waker: embassy_sync::waitqueue::AtomicWaker::new(),
+                    rx_waker: embassy_sync::waitqueue::AtomicWaker::new(),
+                    tx_waker: embassy_sync::waitqueue::AtomicWaker::new(),
                 };
 
                 &STATE
