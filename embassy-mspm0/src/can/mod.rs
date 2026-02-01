@@ -321,11 +321,29 @@ pub struct ErrorCounters {
 }
 
 pub struct Can<'d, M: Mode> {
+    /// Splittable transmit half (only allows touching TX registers). Future expansion - allow one per dedicated TX buffer + one for the queue.
+    tx: CanTx<M>,
+    /// Splittable RX half (only allows touching RX registers) Future expansion - allow one per RX fifo.
+    rx: CanRx<M>,
+    /// Splittable status data - mutates state, so can't be shared/used by both.
+    status: CanStatus<'d>,
+}
+pub struct CanRx<M: Mode> {
     info: &'static Info,
     state: &'static State,
-    _rx: Option<Peri<'d, AnyPin>>,
-    _tx: Option<Peri<'d, AnyPin>>,
     _phantom: PhantomData<M>,
+}
+
+pub struct CanTx<M: Mode> {
+    info: &'static Info,
+    state: &'static State,
+    _phantom: PhantomData<M>,
+}
+
+pub struct CanStatus<'d> {
+    info: &'static Info,
+    _rx: Peri<'d, AnyPin>,
+    _tx: Peri<'d, AnyPin>,
 }
 
 impl<'d> Can<'d, Blocking> {
@@ -347,18 +365,19 @@ impl<'d> Can<'d, Blocking> {
     /// Will return a BusError if the peripheral enters bus-off state,
     /// otherwise will block indefinitely.
     pub fn get_frame_blocking(&mut self) -> Result<MCanFrame, BusError> {
-        loop {
-            if let Some(frame) = self.try_get_frame() {
-                return Ok(frame);
-            }
-
-            // BusOff will never recover by itself in the current implementation - bail so the caller can deal with this.
-            if self.get_error_counters().bus_off {
-                return Err(BusError::BusOff);
-            }
-        }
+        self.rx.get_frame_blocking()
     }
 
+    /// Enqueue a frame to be sent on the bus, blocking until space is available in the transmit queue.
+    ///
+    /// Note that a successful return does _not_ mean the frame was transmitted successfully
+    /// (see module comment - TX confirmation is not currently implemented.)
+    pub fn enqueue_frame_blocking(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
+        self.tx.enqueue_frame_blocking(frame)
+    }
+}
+
+impl CanTx<Blocking> {
     /// Enqueue a frame to be sent on the bus, blocking until space is available in the transmit queue.
     ///
     /// Note that a successful return does _not_ mean the frame was transmitted successfully
@@ -370,7 +389,25 @@ impl<'d> Can<'d, Blocking> {
             }
 
             // BusOff will never recover by itself in the current implementation - bail so the caller can deal with this.
-            if self.get_error_counters().bus_off {
+            if self.info.regs.mcan(0).psr().read().bo() {
+                return Err(BusError::BusOff);
+            }
+        }
+    }
+}
+
+impl CanRx<Blocking> {
+    /// Retrieve a frame from the peripheral in a blocking fashion.
+    /// Will return a BusError if the peripheral enters bus-off state,
+    /// otherwise will block indefinitely.
+    pub fn get_frame_blocking(&mut self) -> Result<MCanFrame, BusError> {
+        loop {
+            if let Some(frame) = self.try_get_frame() {
+                return Ok(frame);
+            }
+
+            // BusOff will never recover by itself in the current implementation - bail so the caller can deal with this.
+            if self.info.regs.mcan(0).psr().read().bo() {
                 return Err(BusError::BusOff);
             }
         }
@@ -386,7 +423,6 @@ impl<'d> Can<'d, Blocking> {
 // I will implement them regardless to play nice with the overall ecosystem,
 // but similar to embassy-stm32, I'm going to offer a HAL-specific API which provides
 // more useful functionality, and add an async variant at some point.
-
 impl<'d> embedded_can::blocking::Can for Can<'d, Blocking> {
     type Error = BusError;
     type Frame = MCanFrame;
@@ -467,19 +503,16 @@ impl<'d> Can<'d, Async> {
 
     /// Enqueue a frame for transmission.
     pub async fn enqueue_frame(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
-        future::poll_fn(|cx| {
-            self.state.tx_waker.register(cx.waker());
-
-            let poll = match self.try_enqueue_frame(frame) {
-                Some(_) => core::task::Poll::Ready(Ok(())),
-                None => core::task::Poll::Pending,
-            };
-
-            return poll;
-        })
-        .await
+        self.tx.enqueue_frame(frame).await
     }
 
+    /// Retrieve a frame from the RX queue.
+    pub async fn get_frame(&mut self) -> Result<MCanFrame, BusError> {
+        self.rx.get_frame().await
+    }
+}
+
+impl CanRx<Async> {
     /// Retrieve a frame from the RX queue.
     pub async fn get_frame(&mut self) -> Result<MCanFrame, BusError> {
         future::poll_fn(|cx| {
@@ -487,6 +520,23 @@ impl<'d> Can<'d, Async> {
 
             let poll = match self.try_get_frame() {
                 Some(frame) => core::task::Poll::Ready(Ok(frame)),
+                None => core::task::Poll::Pending,
+            };
+
+            return poll;
+        })
+        .await
+    }
+}
+
+impl CanTx<Async> {
+    /// Enqueue a frame for transmission.
+    pub async fn enqueue_frame(&mut self, frame: &MCanFrame) -> Result<(), BusError> {
+        future::poll_fn(|cx| {
+            self.state.tx_waker.register(cx.waker());
+
+            let poll = match self.try_enqueue_frame(frame) {
+                Some(_) => core::task::Poll::Ready(Ok(())),
                 None => core::task::Poll::Pending,
             };
 
@@ -658,8 +708,8 @@ impl<'d, M: Mode> Can<'d, M> {
         tx: Peri<'d, impl TxPin<T>>,
         config: Config,
     ) -> Result<Self, ConfigError> {
-        let rx_inner = new_pin!(rx, PfType::input(crate::gpio::Pull::None, false));
-        let tx_inner = new_pin!(tx, PfType::output(crate::gpio::Pull::None, false));
+        let rx_inner = new_pin!(rx, PfType::input(crate::gpio::Pull::None, false)).expect("invalid rx pin somehow?");
+        let tx_inner = new_pin!(tx, PfType::output(crate::gpio::Pull::None, false)).expect("invalid tx pin somehow?");
 
         // Reset and power on the CAN peripheral. Note this _is_ a falliable operation.
         Self::reset_poweron(&peri, &config)?;
@@ -758,12 +808,86 @@ impl<'d, M: Mode> Can<'d, M> {
         })?;
 
         Ok(Can {
-            info: T::info(),
-            state: T::state(),
-            _rx: rx_inner,
-            _tx: tx_inner,
-            _phantom: PhantomData,
+            rx: CanRx {
+                info: T::info(),
+                state: T::state(),
+                _phantom: PhantomData,
+            },
+            tx: CanTx {
+                info: T::info(),
+                state: T::state(),
+                _phantom: PhantomData,
+            },
+            status: CanStatus {
+                info: T::info(),
+                _tx: tx_inner,
+                _rx: rx_inner,
+            },
         })
+    }
+
+    /// Check if a frame is available to be read from the peripheral.
+    pub fn has_frame(&self) -> bool {
+        self.rx.has_frame()
+    }
+
+    /// Retrieve error counters and status from the CAN peripheral.
+    /// Note this is mutable as the `cel` and `lec` field is cleared upon read.
+    pub fn get_error_counters(&mut self) -> ErrorCounters {
+        self.status.get_error_counters()
+    }
+
+    /// Attempt to recover from a bus-off condition.
+    /// Will block until the bus recovers or no progress is made towards recovery (indicating a bus that's still failed in some way)
+    pub fn recover(&mut self) -> Result<(), RecoveryFailure> {
+        self.status.recover()
+    }
+
+    /// Attempt to retrieve a frame from the peripheral.
+    /// Returns None if there is not currently a frame available to read.
+    pub fn try_get_frame(&mut self) -> Option<MCanFrame> {
+        self.rx.try_get_frame()
+    }
+    /// Attempt to enqueue a frame to be sent on the bus.
+    /// If the transmit queue is full, will return None.
+    ///
+    /// Note that a successful return does _not_ mean the frame was transmitted successfully
+    /// (see module comment - TX confirmation is not currently implemented.)
+    pub fn try_enqueue_frame(&mut self, frame: &MCanFrame) -> Option<()> {
+        self.tx.try_enqueue_frame(frame)
+    }
+
+    /// Split this instance into TX, RX, and status modification parts, which can safely be used
+    /// independently.
+    /// In the future, similar methods may allow creation of multiple CanTx and CanRx instances,
+    /// due to the use of dedicated TX and RX buffers / queues.
+    pub fn split(self) -> (CanTx<M>, CanRx<M>, CanStatus<'d>) {
+        (self.tx, self.rx, self.status)
+    }
+}
+
+impl<M: Mode> CanRx<M> {
+    /// Attempt to retrieve a frame from the peripheral.
+    /// Returns None if there is not currently a frame available to read.
+    pub fn try_get_frame(&mut self) -> Option<MCanFrame> {
+        let cur_status = self.info.regs.mcan(0).rxf0s().read();
+        if cur_status.f0gi() == cur_status.f0pi() && !cur_status.f0f() {
+            return None;
+        }
+        let read_index = cur_status.f0gi();
+
+        let element = self
+            .info
+            .mem
+            .get_rx_fifo_element(read_index as usize)
+            .expect("invalid read index - bad peripheral config?");
+
+        // mark the element as acknowledged.
+        self.info.regs.mcan(0).rxf0a().write(|w| {
+            w.set_f0ai(read_index);
+        });
+
+        Some(element.into())
     }
 
     /// Check if a frame is available to be read from the peripheral.
@@ -771,7 +895,39 @@ impl<'d, M: Mode> Can<'d, M> {
         let cur_status = self.info.regs.mcan(0).rxf0s().read();
         cur_status.f0gi() != cur_status.f0pi() || cur_status.f0f()
     }
+}
 
+impl<M: Mode> CanTx<M> {
+    /// Attempt to enqueue a frame to be sent on the bus.
+    /// If the transmit queue is full, will return None.
+    ///
+    /// Note that a successful return does _not_ mean the frame was transmitted successfully
+    /// (see module comment - TX confirmation is not currently implemented.)
+    pub fn try_enqueue_frame(&mut self, frame: &MCanFrame) -> Option<()> {
+        let cur_status = self.info.regs.mcan(0).txfqs().read();
+        if cur_status.tfqf() {
+            // TX queue is full already.
+            // TODO: Consider trying to replace a lower-priority item in the future.
+            return None;
+        }
+
+        let txbuf = frame.to_tx_buffer(None); // note we do not support TX events yet.
+        let write_index = cur_status.tfqp();
+        self.info
+            .mem
+            .set_tx_element(write_index as usize, txbuf)
+            .expect("invalid write index - bad periph config?");
+
+        // tell the peripheral we've written a new entry into the TX FIFO.
+        self.info.regs.mcan(0).txbar().write(|w| {
+            w.0 = 1 << write_index;
+        });
+
+        Some(())
+    }
+}
+
+impl<'d> CanStatus<'d> {
     /// Convert a Last Error Code (LEC) register value to a BusError.
     /// Returns None for value 0 (no error) and values 7+ (reserved/no error).
     fn reg_to_error(value: u8) -> Option<BusError> {
@@ -796,7 +952,7 @@ impl<'d, M: Mode> Can<'d, M> {
             tec: counters.tec(),
             rec: counters.rec(),
             cel: counters.cel(),
-            lec: Can::<M>::reg_to_error(status.lec()),
+            lec: CanStatus::reg_to_error(status.lec()),
 
             bus_off: status.bo(),
             error_passive: status.ep(),
@@ -811,7 +967,7 @@ impl<'d, M: Mode> Can<'d, M> {
         let mut noprogress_iterations: u32 = 0;
         loop {
             let psr = mcan.psr().read();
-            let lec = Can::<M>::reg_to_error(psr.lec());
+            let lec = CanStatus::reg_to_error(psr.lec());
             // Completed recovery?
             if !psr.bo() {
                 break;
@@ -848,56 +1004,6 @@ impl<'d, M: Mode> Can<'d, M> {
         }
 
         Ok(())
-    }
-
-    /// Attempt to retrieve a frame from the peripheral.
-    /// Returns None if there is not currently a frame available to read.
-    pub fn try_get_frame(&mut self) -> Option<MCanFrame> {
-        let cur_status = self.info.regs.mcan(0).rxf0s().read();
-        if cur_status.f0gi() == cur_status.f0pi() && !cur_status.f0f() {
-            return None;
-        }
-        let read_index = cur_status.f0gi();
-
-        let element = self
-            .info
-            .mem
-            .get_rx_fifo_element(read_index as usize)
-            .expect("invalid read index - bad peripheral config?");
-
-        // mark the element as acknowledged.
-        self.info.regs.mcan(0).rxf0a().write(|w| {
-            w.set_f0ai(read_index);
-        });
-
-        Some(element.into())
-    }
-    /// Attempt to enqueue a frame to be sent on the bus.
-    /// If the transmit queue is full, will return None.
-    ///
-    /// Note that a successful return does _not_ mean the frame was transmitted successfully
-    /// (see module comment - TX confirmation is not currently implemented.)
-    pub fn try_enqueue_frame(&mut self, frame: &MCanFrame) -> Option<()> {
-        let cur_status = self.info.regs.mcan(0).txfqs().read();
-        if cur_status.tfqf() {
-            // TX queue is full already.
-            // TODO: Consider trying to replace a lower-priority item in the future.
-            return None;
-        }
-
-        let txbuf = frame.to_tx_buffer(None); // note we do not support TX events yet.
-        let write_index = cur_status.tfqp();
-        self.info
-            .mem
-            .set_tx_element(write_index as usize, txbuf)
-            .expect("invalid write index - bad periph config?");
-
-        // tell the peripheral we've written a new entry into the TX FIFO.
-        self.info.regs.mcan(0).txbar().write(|w| {
-            w.0 = 1 << write_index;
-        });
-
-        Some(())
     }
 }
 
