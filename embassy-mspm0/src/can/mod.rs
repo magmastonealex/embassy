@@ -97,13 +97,11 @@ impl<T: Instance> crate::interrupt::typelevel::Handler<T::Interrupt> for Interru
 
             if flags.tc() {
                 T::state().tx_waker.wake();
-                debug!("tx complete");
                 T::info().regs.mcan(0).ir().write(|w| w.set_tc(true));
             }
 
             if flags.rf0n() {
                 T::state().rx_waker.wake();
-                debug!("rx new");
                 T::info().regs.mcan(0).ir().write(|w| w.set_rf0n(true))
             }
         }
